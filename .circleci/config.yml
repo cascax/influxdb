@@ -541,8 +541,7 @@ commands:
                     --debug \
                     release \
                       -p 1 \
-                      --rm-dist \
-                      --skip-validate
+                      --rm-dist
       - when:
           condition:
             and:
