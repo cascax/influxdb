@@ -536,7 +536,7 @@ commands:
                     VERSION_TAG="<< parameters.build_tag >>"
                   fi
                   S3_FOLDER="influxdb/releases/" \
-                  VERSION=${VERSION_TAG##v} \
+                  GORELEASER_CURRENT_TAG=${VERSION_TAG##v} \
                   goreleaser \
                     --debug \
                     release \

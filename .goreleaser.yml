@@ -24,7 +24,7 @@ builds:
       - PKG_CONFIG=$GOPATH/bin/pkg-config
       - MACOSX_DEPLOYMENT_TARGET=10.11
     ldflags:
-      - -s -w -X main.version={{.Env.VERSION}} -X main.commit={{.ShortCommit}} -X main.date={{.Date}} {{if eq .Os "linux"}}-extldflags "-fno-PIC -static -Wl,-z,stack-size=8388608"{{end}}
+      - -s -w -X main.version={{.Env.GORELEASER_CURRENT_TAG}} -X main.commit={{.ShortCommit}} -X main.date={{.Date}} {{if eq .Os "linux"}}-extldflags "-fno-PIC -static -Wl,-z,stack-size=8388608"{{end}}
     binary: influxd
     hooks:
       pre: make generate-web-assets
@@ -63,9 +63,9 @@ nfpms:
           amd64: x86_64
           arm64: aarch64
           armhf: armv7hl
-        file_name_template: "influxdb2-{{ .Env.VERSION }}.{{ .Arch }}"
+        file_name_template: "influxdb2-{{ .Env.GORELEASER_CURRENT_TAG }}.{{ .Arch }}"
       deb:
-        file_name_template: "influxdb2-{{ .Env.VERSION }}-{{ .Arch }}"
+        file_name_template: "influxdb2-{{ .Env.GORELEASER_CURRENT_TAG }}-{{ .Arch }}"
     vendor: InfluxData
     homepage: https://influxdata.com
     maintainer: support@influxdb.com
@@ -79,7 +79,7 @@ archives:
       - goos: windows
         format: zip
     wrap_in_directory: true
-    name_template: "influxdb2-{{ .Env.VERSION }}-{{ .Os }}-{{ .Arch }}"
+    name_template: "influxdb2-{{ .Env.GORELEASER_CURRENT_TAG }}-{{ .Os }}-{{ .Arch }}"
     files:
       - LICENSE
       - README.md
@@ -93,14 +93,14 @@ blobs:
       - glob: ./changelog_artifacts/CHANGELOG*.md
 
 checksum:
-  name_template: "influxdb2-{{ .Env.VERSION }}.sha256"
+  name_template: "influxdb2-{{ .Env.GORELEASER_CURRENT_TAG }}.sha256"
   algorithm: sha256
 
 dockers:
   - goos: linux
     goarch: amd64
     image_templates:
-      - "quay.io/influxdb/influxdb-amd64:{{ .Env.VERSION }}"
+      - "quay.io/influxdb/influxdb-amd64:{{ .Env.GORELEASER_CURRENT_TAG }}"
     dockerfile: docker/influxd/Dockerfile
     extra_files:
       - docker/influxd/entrypoint.sh
@@ -110,7 +110,7 @@ dockers:
   - goos: linux
     goarch: arm64
     image_templates:
-      - "quay.io/influxdb/influxdb-arm64v8:{{ .Env.VERSION }}"
+      - "quay.io/influxdb/influxdb-arm64v8:{{ .Env.GORELEASER_CURRENT_TAG }}"
     dockerfile: docker/influxd/Dockerfile
     extra_files:
       - docker/influxd/entrypoint.sh
@@ -119,10 +119,10 @@ dockers:
     use_buildx: true
 
 docker_manifests:
-  - name_template: "quay.io/influxdb/influxdb:{{ .Env.VERSION }}"
+  - name_template: "quay.io/influxdb/influxdb:{{ .Env.GORELEASER_CURRENT_TAG }}"
     image_templates:
-      - "quay.io/influxdb/influxdb-amd64:{{ .Env.VERSION }}"
-      - "quay.io/influxdb/influxdb-arm64v8:{{ .Env.VERSION }}"
+      - "quay.io/influxdb/influxdb-amd64:{{ .Env.GORELEASER_CURRENT_TAG }}"
+      - "quay.io/influxdb/influxdb-arm64v8:{{ .Env.GORELEASER_CURRENT_TAG }}"
 
 signs:
   - signature: "${artifact}.asc"
