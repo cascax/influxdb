@@ -3,10 +3,10 @@ package tsdb
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -16,48 +16,35 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 	"unsafe"
 
 	"github.com/influxdata/influxdb/v2/influxql/query"
+	"github.com/influxdata/influxdb/v2/logger"
 	"github.com/influxdata/influxdb/v2/models"
 	"github.com/influxdata/influxdb/v2/pkg/bytesutil"
+	errors2 "github.com/influxdata/influxdb/v2/pkg/errors"
 	"github.com/influxdata/influxdb/v2/pkg/estimator"
 	"github.com/influxdata/influxdb/v2/pkg/file"
 	"github.com/influxdata/influxdb/v2/pkg/limiter"
 	"github.com/influxdata/influxdb/v2/pkg/slices"
 	internal "github.com/influxdata/influxdb/v2/tsdb/internal"
 	"github.com/influxdata/influxql"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 )
 
 const (
-	statWriteReq           = "writeReq"
-	statWriteReqOK         = "writeReqOk"
-	statWriteReqErr        = "writeReqErr"
-	statSeriesCreate       = "seriesCreate"
-	statFieldsCreate       = "fieldsCreate"
-	statWritePointsErr     = "writePointsErr"
-	statWritePointsDropped = "writePointsDropped"
-	statWritePointsOK      = "writePointsOk"
-	statWriteBytes         = "writeBytes"
-	statDiskBytes          = "diskBytes"
-	measurementKey         = "_name"
+	measurementKey        = "_name"
+	DefaultMetricInterval = 10 * time.Second
+	FieldsChangeFile      = "fields.idxl"
+	bytesInInt64          = 8
 )
 
 var (
-	// ErrFieldOverflow is returned when too many fields are created on a measurement.
-	ErrFieldOverflow = errors.New("field overflow")
-
 	// ErrFieldTypeConflict is returned when a new field already exists with a different type.
 	ErrFieldTypeConflict = errors.New("field type conflict")
-
-	// ErrFieldNotFound is returned when a field cannot be found.
-	ErrFieldNotFound = errors.New("field not found")
-
-	// ErrFieldUnmappedID is returned when the system is presented, during decode, with a field ID
-	// there is no mapping for.
-	ErrFieldUnmappedID = errors.New("field ID not mapped")
 
 	// ErrEngineClosed is returned when a caller attempts indirectly to
 	// access the shard's underlying engine.
@@ -141,12 +128,12 @@ type Shard struct {
 	index   Index
 	enabled bool
 
-	// expvar-based stats.
-	stats       *ShardStatistics
-	defaultTags models.StatisticTags
+	stats *ShardMetrics
 
 	baseLogger *zap.Logger
 	logger     *zap.Logger
+
+	metricUpdater *ticker
 
 	EnableOnOpen bool
 
@@ -160,29 +147,26 @@ func NewShard(id uint64, path string, walPath string, sfile *SeriesFile, opt Eng
 	db, rp := decodeStorePath(path)
 	logger := zap.NewNop()
 
+	engineTags := EngineTags{
+		Path:          path,
+		WalPath:       walPath,
+		Id:            fmt.Sprintf("%d", id),
+		Bucket:        db,
+		EngineVersion: opt.EngineVersion,
+	}
+
 	s := &Shard{
-		id:      id,
-		path:    path,
-		walPath: walPath,
-		sfile:   sfile,
-		options: opt,
-
-		stats: &ShardStatistics{},
-		defaultTags: models.StatisticTags{
-			"path":            path,
-			"walPath":         walPath,
-			"id":              fmt.Sprintf("%d", id),
-			"database":        db,
-			"retentionPolicy": rp,
-			"engine":          opt.EngineVersion,
-		},
-
+		id:              id,
+		path:            path,
+		walPath:         walPath,
+		sfile:           sfile,
+		options:         opt,
+		stats:           newShardMetrics(engineTags),
 		database:        db,
 		retentionPolicy: rp,
-
-		logger:       logger,
-		baseLogger:   logger,
-		EnableOnOpen: true,
+		logger:          logger,
+		baseLogger:      logger,
+		EnableOnOpen:    true,
 	}
 	return s
 }
@@ -202,13 +186,18 @@ func (s *Shard) WithLogger(log *zap.Logger) {
 // writes and queries return an error and compactions are stopped for the shard.
 func (s *Shard) SetEnabled(enabled bool) {
 	s.mu.Lock()
+	s.setEnabledNoLock(enabled)
+	s.mu.Unlock()
+}
+
+//! setEnabledNoLock performs actual work of SetEnabled. Must hold s.mu before calling.
+func (s *Shard) setEnabledNoLock(enabled bool) {
 	// Prevent writes and queries
 	s.enabled = enabled
 	if s._engine != nil && !s.CompactionDisabled {
 		// Disable background compactions and snapshotting
 		s._engine.SetEnabled(enabled)
 	}
-	s.mu.Unlock()
 }
 
 // ScheduleFullCompaction forces a full compaction to be schedule on the shard.
@@ -235,60 +224,140 @@ func (s *Shard) RetentionPolicy() string {
 	return s.retentionPolicy
 }
 
-// ShardStatistics maintains statistics for a shard.
-type ShardStatistics struct {
-	WriteReq           int64
-	WriteReqOK         int64
-	WriteReqErr        int64
-	FieldsCreated      int64
-	WritePointsErr     int64
-	WritePointsDropped int64
-	WritePointsOK      int64
-	BytesWritten       int64
-	DiskBytes          int64
+var globalShardMetrics = newAllShardMetrics()
+
+type twoCounterObserver struct {
+	count prometheus.Counter
+	sum   prometheus.Counter
 }
 
-// Statistics returns statistics for periodic monitoring.
-func (s *Shard) Statistics(tags map[string]string) []models.Statistic {
-	engine, err := s.Engine()
-	if err != nil {
-		return nil
+func (t twoCounterObserver) Observe(f float64) {
+	t.sum.Inc()
+	t.count.Add(f)
+}
+
+var _ prometheus.Observer = twoCounterObserver{}
+
+type allShardMetrics struct {
+	writes        *prometheus.CounterVec
+	writesSum     *prometheus.CounterVec
+	writesErr     *prometheus.CounterVec
+	writesErrSum  *prometheus.CounterVec
+	writesDropped *prometheus.CounterVec
+	fieldsCreated *prometheus.CounterVec
+	diskSize      *prometheus.GaugeVec
+	series        *prometheus.GaugeVec
+}
+
+type ShardMetrics struct {
+	writes        prometheus.Observer
+	writesErr     prometheus.Observer
+	writesDropped prometheus.Counter
+	fieldsCreated prometheus.Counter
+	diskSize      prometheus.Gauge
+	series        prometheus.Gauge
+}
+
+const storageNamespace = "storage"
+const shardSubsystem = "shard"
+
+func newAllShardMetrics() *allShardMetrics {
+	labels := EngineLabelNames()
+	return &allShardMetrics{
+		writes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: storageNamespace,
+			Subsystem: shardSubsystem,
+			Name:      "write_count",
+			Help:      "Count of the number of write requests",
+		}, labels),
+		writesSum: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: storageNamespace,
+			Subsystem: shardSubsystem,
+			Name:      "write_sum",
+			Help:      "Counter of the number of points for write requests",
+		}, labels),
+		writesErr: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: storageNamespace,
+			Subsystem: shardSubsystem,
+			Name:      "write_err_count",
+			Help:      "Count of the number of write requests with errors",
+		}, labels),
+		writesErrSum: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: storageNamespace,
+			Subsystem: shardSubsystem,
+			Name:      "write_err_sum",
+			Help:      "Counter of the number of points for write requests with errors",
+		}, labels),
+		writesDropped: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: storageNamespace,
+			Subsystem: shardSubsystem,
+			Name:      "write_dropped_sum",
+			Help:      "Counter of the number of points droppped",
+		}, labels),
+		fieldsCreated: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: storageNamespace,
+			Subsystem: shardSubsystem,
+			Name:      "fields_created",
+			Help:      "Counter of the number of fields created",
+		}, labels),
+		diskSize: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: storageNamespace,
+			Subsystem: shardSubsystem,
+			Name:      "disk_size",
+			Help:      "Gauge of the disk size for the shard",
+		}, labels),
+		series: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: storageNamespace,
+			Subsystem: shardSubsystem,
+			Name:      "series",
+			Help:      "Gauge of the number of series in the shard index",
+		}, labels),
 	}
+}
 
-	// Refresh our disk size stat
-	if _, err := s.DiskSize(); err != nil {
-		return nil
+func ShardCollectors() []prometheus.Collector {
+	return []prometheus.Collector{
+		globalShardMetrics.writes,
+		globalShardMetrics.writesSum,
+		globalShardMetrics.writesErr,
+		globalShardMetrics.writesErrSum,
+		globalShardMetrics.writesDropped,
+		globalShardMetrics.fieldsCreated,
+		globalShardMetrics.diskSize,
+		globalShardMetrics.series,
 	}
-	seriesN := engine.SeriesN()
+}
 
-	tags = s.defaultTags.Merge(tags)
-
-	// Set the index type on the tags.  N.B this needs to be checked since it's
-	// only set when the shard is opened.
-	if indexType := s.IndexType(); indexType != "" {
-		tags["indexType"] = indexType
-	}
-
-	statistics := []models.Statistic{{
-		Name: "shard",
-		Tags: tags,
-		Values: map[string]interface{}{
-			statWriteReq:           atomic.LoadInt64(&s.stats.WriteReq),
-			statWriteReqOK:         atomic.LoadInt64(&s.stats.WriteReqOK),
-			statWriteReqErr:        atomic.LoadInt64(&s.stats.WriteReqErr),
-			statSeriesCreate:       seriesN,
-			statFieldsCreate:       atomic.LoadInt64(&s.stats.FieldsCreated),
-			statWritePointsErr:     atomic.LoadInt64(&s.stats.WritePointsErr),
-			statWritePointsDropped: atomic.LoadInt64(&s.stats.WritePointsDropped),
-			statWritePointsOK:      atomic.LoadInt64(&s.stats.WritePointsOK),
-			statWriteBytes:         atomic.LoadInt64(&s.stats.BytesWritten),
-			statDiskBytes:          atomic.LoadInt64(&s.stats.DiskBytes),
+func newShardMetrics(tags EngineTags) *ShardMetrics {
+	labels := tags.GetLabels()
+	return &ShardMetrics{
+		writes: twoCounterObserver{
+			count: globalShardMetrics.writes.With(labels),
+			sum:   globalShardMetrics.writesSum.With(labels),
 		},
-	}}
+		writesErr: twoCounterObserver{
+			count: globalShardMetrics.writesErr.With(labels),
+			sum:   globalShardMetrics.writesErrSum.With(labels),
+		},
+		writesDropped: globalShardMetrics.writesDropped.With(labels),
+		fieldsCreated: globalShardMetrics.fieldsCreated.With(labels),
+		diskSize:      globalShardMetrics.diskSize.With(labels),
+		series:        globalShardMetrics.series.With(labels),
+	}
+}
 
-	// Add the index and engine statistics.
-	statistics = append(statistics, engine.Statistics(tags)...)
-	return statistics
+// ticker runs fn periodically, and stops when Stop() is called
+//
+// Stop waits for the last function run to finish if already running
+type ticker struct {
+	wg      sync.WaitGroup
+	closing chan struct{}
+}
+
+// Stops the ticker and waits for the function to complete
+func (t *ticker) Stop() {
+	close(t.closing)
+	t.wg.Wait()
 }
 
 // Path returns the path set on the shard when it was created.
@@ -296,10 +365,24 @@ func (s *Shard) Path() string { return s.path }
 
 // Open initializes and opens the shard's store.
 func (s *Shard) Open(ctx context.Context) error {
-	if err := func() error {
-		s.mu.Lock()
-		defer s.mu.Unlock()
+	s.mu.Lock()
+	closeWaitNeeded, err := s.openNoLock(ctx)
+	s.mu.Unlock()
+	if closeWaitNeeded {
+		werr := s.closeWait()
+		// We want the first error we get returned to the caller
+		if err == nil {
+			err = werr
+		}
+	}
+	return err
+}
 
+// openNoLock performs work of Open. Must hold s.mu before calling. The first return
+// value is true if the caller should call closeWait after unlocking s.mu in order
+// to clean up a failed open operation.
+func (s *Shard) openNoLock(ctx context.Context) (bool, error) {
+	if err := func() error {
 		// Return if the shard is already open
 		if s._engine != nil {
 			return nil
@@ -355,32 +438,79 @@ func (s *Shard) Open(ctx context.Context) error {
 		}
 		s._engine = e
 
+		// Set up metric collection
+		metricUpdater := &ticker{
+			closing: make(chan struct{}),
+		}
+
+		// We want a way to turn off the series and disk size metrics if they are suspected to cause issues
+		// This corresponds to the top-level MetricsDisabled argument
+		if !s.options.MetricsDisabled {
+			metricUpdater.wg.Add(1)
+			go func() {
+				tick := time.NewTicker(DefaultMetricInterval)
+				defer metricUpdater.wg.Done()
+				defer tick.Stop()
+				for {
+					select {
+					case <-tick.C:
+						// Note this takes the engine lock, so we have to be careful not
+						// to close metricUpdater.closing while holding the engine lock
+						e, err := s.Engine()
+						if err != nil {
+							continue
+						}
+						s.stats.series.Set(float64(e.SeriesN()))
+						s.stats.diskSize.Set(float64(e.DiskSize()))
+					case <-metricUpdater.closing:
+						return
+					}
+				}
+			}()
+		}
+
+		s.metricUpdater = metricUpdater
+
 		return nil
 	}(); err != nil {
-		s.close()
-		return NewShardError(s.id, err)
+		s.closeNoLock()
+		return true, NewShardError(s.id, err)
 	}
 
 	if s.EnableOnOpen {
 		// enable writes, queries and compactions
-		s.SetEnabled(true)
+		s.setEnabledNoLock(true)
 	}
 
-	return nil
+	return false, nil
 }
 
 // Close shuts down the shard's store.
 func (s *Shard) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.close()
+	err := func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.closeNoLock()
+	}()
+	// make sure not to hold a lock while waiting for close to finish
+	werr := s.closeWait()
+
+	if err != nil {
+		return err
+	}
+	return werr
 }
 
-// close closes the shard an removes reference to the shard from associated
-// indexes, unless clean is false.
-func (s *Shard) close() error {
+// closeNoLock closes the shard an removes reference to the shard from associated
+// indexes. The s.mu mutex must be held before calling closeNoLock. closeWait should always
+// be called after calling closeNoLock.
+func (s *Shard) closeNoLock() error {
 	if s._engine == nil {
 		return nil
+	}
+
+	if s.metricUpdater != nil {
+		close(s.metricUpdater.closing)
 	}
 
 	err := s._engine.Close()
@@ -392,6 +522,18 @@ func (s *Shard) close() error {
 		s.index = nil
 	}
 	return err
+}
+
+// closeWait waits for goroutines and other background operations associated with this
+// shard to complete after closeNoLock is called. Must only be called after calling
+// closeNoLock. closeWait should always be called after calling closeNoLock.
+// Public methods which close the shard should call closeWait after closeNoLock before
+// returning. Must be called without holding shard locks to avoid deadlocking.
+func (s *Shard) closeWait() error {
+	if s.metricUpdater != nil {
+		s.metricUpdater.wg.Wait()
+	}
+	return nil
 }
 
 // IndexType returns the index version being used for this shard.
@@ -490,7 +632,6 @@ func (s *Shard) DiskSize() (int64, error) {
 		return 0, ErrEngineClosed
 	}
 	size := s._engine.DiskSize()
-	atomic.StoreInt64(&s.stats.DiskBytes, size)
 	return size, nil
 }
 
@@ -501,7 +642,7 @@ type FieldCreate struct {
 }
 
 // WritePoints will write the raw data points and any new metadata to the index in the shard.
-func (s *Shard) WritePoints(ctx context.Context, points []models.Point) error {
+func (s *Shard) WritePoints(ctx context.Context, points []models.Point) (rErr error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -511,7 +652,12 @@ func (s *Shard) WritePoints(ctx context.Context, points []models.Point) error {
 	}
 
 	var writeError error
-	atomic.AddInt64(&s.stats.WriteReq, 1)
+	s.stats.writes.Observe(float64(len(points)))
+	defer func() {
+		if rErr != nil {
+			s.stats.writesErr.Observe(float64(len(points)))
+		}
+	}()
 
 	points, fieldsToCreate, err := s.validateSeriesAndFields(points)
 	if err != nil {
@@ -522,7 +668,7 @@ func (s *Shard) WritePoints(ctx context.Context, points []models.Point) error {
 		// to the caller, but continue on writing the remaining points.
 		writeError = err
 	}
-	atomic.AddInt64(&s.stats.FieldsCreated, int64(len(fieldsToCreate)))
+	s.stats.fieldsCreated.Add(float64(len(fieldsToCreate)))
 
 	// add any new fields and keep track of what needs to be saved
 	if err := s.createFieldsAndMeasurements(fieldsToCreate); err != nil {
@@ -531,12 +677,8 @@ func (s *Shard) WritePoints(ctx context.Context, points []models.Point) error {
 
 	// Write to the engine.
 	if err := engine.WritePoints(ctx, points); err != nil {
-		atomic.AddInt64(&s.stats.WritePointsErr, int64(len(points)))
-		atomic.AddInt64(&s.stats.WriteReqErr, 1)
 		return fmt.Errorf("engine: %s", err)
 	}
-	atomic.AddInt64(&s.stats.WritePointsOK, int64(len(points)))
-	atomic.AddInt64(&s.stats.WriteReqOK, 1)
 
 	return writeError
 }
@@ -577,7 +719,7 @@ func (s *Shard) validateSeriesAndFields(points []models.Point) ([]models.Point, 
 		if validateKeys && !models.ValidKeyTokens(string(p.Name()), tags) {
 			dropped++
 			if reason == "" {
-				reason = fmt.Sprintf("key contains invalid unicode: \"%s\"", string(p.Key()))
+				reason = fmt.Sprintf("key contains invalid unicode: %q", makePrintable(string(p.Key())))
 			}
 			continue
 		}
@@ -599,14 +741,17 @@ func (s *Shard) validateSeriesAndFields(points []models.Point) ([]models.Point, 
 	var droppedKeys [][]byte
 	if err := engine.CreateSeriesListIfNotExists(keys, names, tagsSlice); err != nil {
 		switch err := err.(type) {
-		// TODO(jmw): why is this a *PartialWriteError when everything else is not a pointer?
-		// Maybe we can just change it to be consistent if we change it also in all
-		// the places that construct it.
+		// (DSB) This was previously *PartialWriteError. Now catch pointer and value types.
 		case *PartialWriteError:
 			reason = err.Reason
 			dropped += err.Dropped
 			droppedKeys = err.DroppedKeys
-			atomic.AddInt64(&s.stats.WritePointsDropped, int64(err.Dropped))
+			s.stats.writesDropped.Add(float64(err.Dropped))
+		case PartialWriteError:
+			reason = err.Reason
+			dropped += err.Dropped
+			droppedKeys = err.DroppedKeys
+			s.stats.writesDropped.Add(float64(err.Dropped))
 		default:
 			return nil, nil, err
 		}
@@ -650,7 +795,7 @@ func (s *Shard) validateSeriesAndFields(points []models.Point) ([]models.Point, 
 					reason = err.Reason
 				}
 				dropped += err.Dropped
-				atomic.AddInt64(&s.stats.WritePointsDropped, int64(err.Dropped))
+				s.stats.writesDropped.Add(float64(err.Dropped))
 			default:
 				return nil, nil, err
 			}
@@ -696,6 +841,28 @@ func (s *Shard) validateSeriesAndFields(points []models.Point) ([]models.Point, 
 	return points[:j], fieldsToCreate, err
 }
 
+const unPrintReplRune = '?'
+const unPrintMaxReplRune = 3
+
+// makePrintable - replace invalid and non-printable unicode characters with a few '?' runes
+func makePrintable(s string) string {
+	b := strings.Builder{}
+	b.Grow(len(s))
+	c := 0
+	for _, r := range strings.ToValidUTF8(s, string(unicode.ReplacementChar)) {
+		if !unicode.IsPrint(r) || r == unicode.ReplacementChar {
+			if c < unPrintMaxReplRune {
+				b.WriteRune(unPrintReplRune)
+			}
+			c++
+		} else {
+			b.WriteRune(r)
+			c = 0
+		}
+	}
+	return b.String()
+}
+
 func (s *Shard) createFieldsAndMeasurements(fieldsToCreate []*FieldCreate) error {
 	if len(fieldsToCreate) == 0 {
 		return nil
@@ -707,14 +874,19 @@ func (s *Shard) createFieldsAndMeasurements(fieldsToCreate []*FieldCreate) error
 	}
 
 	// add fields
+	changes := make([]*FieldChange, 0, len(fieldsToCreate))
 	for _, f := range fieldsToCreate {
 		mf := engine.MeasurementFields(f.Measurement)
 		if err := mf.CreateFieldIfNotExists([]byte(f.Field.Name), f.Field.Type); err != nil {
 			return err
 		}
+		changes = append(changes, &FieldChange{
+			FieldCreate: *f,
+			ChangeType:  AddMeasurementField,
+		})
 	}
 
-	return engine.MeasurementFieldSet().Save()
+	return engine.MeasurementFieldSet().Save(changes)
 }
 
 // DeleteSeriesRange deletes all values from for seriesKeys between min and max (inclusive)
@@ -813,17 +985,6 @@ func (s *Shard) MeasurementExists(name []byte) (bool, error) {
 		return false, err
 	}
 	return engine.MeasurementExists(name)
-}
-
-// WriteTo writes the shard's data to w.
-func (s *Shard) WriteTo(w io.Writer) (int64, error) {
-	engine, err := s.Engine()
-	if err != nil {
-		return 0, err
-	}
-	n, err := engine.WriteTo(w)
-	atomic.AddInt64(&s.stats.BytesWritten, int64(n))
-	return n, err
 }
 
 // CreateIterator returns an iterator for the data in the shard.
@@ -1067,29 +1228,45 @@ func (s *Shard) Export(w io.Writer, basePath string, start time.Time, end time.T
 // Restore restores data to the underlying engine for the shard.
 // The shard is reopened after restore.
 func (s *Shard) Restore(ctx context.Context, r io.Reader, basePath string) error {
-	if err := func() error {
+	closeWaitNeeded, err := func() (bool, error) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
+
+		closeWaitNeeded := false
 
 		// Special case - we can still restore to a disabled shard, so we should
 		// only check if the engine is closed and not care if the shard is
 		// disabled.
 		if s._engine == nil {
-			return ErrEngineClosed
+			return closeWaitNeeded, ErrEngineClosed
 		}
 
 		// Restore to engine.
-		return s._engine.Restore(r, basePath)
-	}(); err != nil {
+		if err := s._engine.Restore(r, basePath); err != nil {
+			return closeWaitNeeded, nil
+		}
+
+		// Close shard.
+		closeWaitNeeded = true // about to call closeNoLock, closeWait will be needed
+		if err := s.closeNoLock(); err != nil {
+			return closeWaitNeeded, err
+		}
+		return closeWaitNeeded, nil
+	}()
+
+	// Now that we've unlocked, we can call closeWait if needed
+	if closeWaitNeeded {
+		werr := s.closeWait()
+		// Return the first error encountered to the caller
+		if err == nil {
+			err = werr
+		}
+	}
+	if err != nil {
 		return err
 	}
 
-	// Close shard.
-	if err := s.Close(); err != nil {
-		return err
-	}
-
-	// Reopen engine.
+	// Reopen engine. Need locked method since we had to unlock for closeWait.
 	return s.Open(ctx)
 }
 
@@ -1749,33 +1926,65 @@ func (m *MeasurementFields) ForEachField(fn func(name string, typ influxql.DataT
 	}
 }
 
+type FieldChanges []*FieldChange
+
+func MeasurementsToFieldChangeDeletions(measurements []string) FieldChanges {
+	fcs := make([]*FieldChange, 0, len(measurements))
+	for _, m := range measurements {
+		fcs = append(fcs, &FieldChange{
+			FieldCreate: FieldCreate{
+				Measurement: []byte(m),
+				Field:       nil,
+			},
+			ChangeType: DeleteMeasurement,
+		})
+	}
+	return fcs
+}
+
 // MeasurementFieldSet represents a collection of fields by measurement.
 // This safe for concurrent use.
 type MeasurementFieldSet struct {
 	mu     sync.RWMutex
 	fields map[string]*MeasurementFields
 	// path is the location to persist field sets
-	path   string
-	writer *MeasurementFieldSetWriter
+	path      string
+	changeMgr *measurementFieldSetChangeMgr
 }
 
 // NewMeasurementFieldSet returns a new instance of MeasurementFieldSet.
-func NewMeasurementFieldSet(path string) (*MeasurementFieldSet, error) {
+func NewMeasurementFieldSet(path string, logger *zap.Logger) (*MeasurementFieldSet, error) {
 	const MaxCombinedWrites = 100
 	fs := &MeasurementFieldSet{
 		fields: make(map[string]*MeasurementFields),
 		path:   path,
 	}
-	fs.SetMeasurementFieldSetWriter(MaxCombinedWrites)
+	if nil == logger {
+		logger = zap.NewNop()
+	}
+	fs.SetMeasurementFieldSetWriter(MaxCombinedWrites, logger)
 	// If there is a load error, return the error and an empty set so
 	// it can be rebuild manually.
 	return fs, fs.load()
 }
 
-func (fs *MeasurementFieldSet) Close() {
-	if fs != nil && fs.writer != nil {
-		fs.writer.Close()
+func (fs *MeasurementFieldSet) Close() error {
+	if fs != nil && fs.changeMgr != nil {
+		fs.changeMgr.Close()
+		// If there is a change log file, save the in-memory version
+		if _, err := os.Stat(fs.changeMgr.changeFilePath); err == nil {
+			return fs.WriteToFile()
+		} else if os.IsNotExist(err) {
+			return nil
+		} else {
+			return fmt.Errorf("cannot get file information for %s: %w", fs.changeMgr.changeFilePath, err)
+		}
 	}
+	return nil
+}
+
+func (fs *MeasurementFieldSet) ChangesPath() string {
+	return fs.changeMgr.changeFilePath
 }
 
 // Bytes estimates the memory footprint of this MeasurementFieldSet, in bytes.
@@ -1791,6 +2000,20 @@ func (fs *MeasurementFieldSet) Bytes() int {
 	b += int(unsafe.Sizeof(fs.path)) + len(fs.path)
 	fs.mu.RUnlock()
 	return b
+}
+
+// MeasurementNames returns the names of all of the measurements in the field set in
+// lexographical order.
+func (fs *MeasurementFieldSet) MeasurementNames() []string {
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+
+	names := make([]string, 0, len(fs.fields))
+	for name := range fs.fields {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // Fields returns fields for a measurement by name.
@@ -1832,7 +2055,7 @@ func (fs *MeasurementFieldSet) CreateFieldsIfNotExists(name []byte) *Measurement
 // Delete removes a field set for a measurement.
 func (fs *MeasurementFieldSet) Delete(name string) {
 	fs.mu.Lock()
-	delete(fs.fields, name)
+	fs.deleteNoLock(name)
 	fs.mu.Unlock()
 }
 
@@ -1845,8 +2068,13 @@ func (fs *MeasurementFieldSet) DeleteWithLock(name string, fn func() error) erro
 		return err
 	}
 
-	delete(fs.fields, name)
+	fs.deleteNoLock(name)
 	return nil
+}
+
+// deleteNoLock removes a field set for a measurement
+func (fs *MeasurementFieldSet) deleteNoLock(name string) {
+	delete(fs.fields, name)
 }
 
 func (fs *MeasurementFieldSet) IsEmpty() bool {
@@ -1858,154 +2086,247 @@ func (fs *MeasurementFieldSet) IsEmpty() bool {
 type errorChannel chan<- error
 
 type writeRequest struct {
-	done errorChannel
+	errorReturn chan<- error
+	changes     FieldChanges
 }
 
-type MeasurementFieldSetWriter struct {
-	wg            sync.WaitGroup
-	writeRequests chan writeRequest
+type measurementFieldSetChangeMgr struct {
+	mu             sync.Mutex
+	wg             sync.WaitGroup
+	writeRequests  chan writeRequest
+	changeFilePath string
+	logger         *zap.Logger
+	changeFileSize int64
 }
 
 // SetMeasurementFieldSetWriter - initialize the queue for write requests
 // and start the background write process
-func (fs *MeasurementFieldSet) SetMeasurementFieldSetWriter(queueLength int) {
+func (fs *MeasurementFieldSet) SetMeasurementFieldSetWriter(queueLength int, logger *zap.Logger) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-	fs.writer = &MeasurementFieldSetWriter{writeRequests: make(chan writeRequest, queueLength)}
-	fs.writer.wg.Add(1)
-	go fs.saveWriter()
+	fs.changeMgr = &measurementFieldSetChangeMgr{
+		writeRequests:  make(chan writeRequest, queueLength),
+		changeFilePath: filepath.Join(filepath.Dir(fs.path), FieldsChangeFile),
+		logger:         logger,
+		changeFileSize: int64(0),
+	}
+	fs.changeMgr.wg.Add(1)
+	go fs.changeMgr.SaveWriter()
 }
 
-func (w *MeasurementFieldSetWriter) Close() {
-	if w != nil {
-		close(w.writeRequests)
-		w.wg.Wait()
+func (fscm *measurementFieldSetChangeMgr) Close() {
+	if fscm != nil {
+		close(fscm.writeRequests)
+		fscm.wg.Wait()
 	}
 }
 
-func (fs *MeasurementFieldSet) Save() error {
-	return fs.writer.RequestSave()
+func (fs *MeasurementFieldSet) Save(changes FieldChanges) error {
+	return fs.changeMgr.RequestSave(changes)
 }
 
-func (w *MeasurementFieldSetWriter) RequestSave() error {
+func (fscm *measurementFieldSetChangeMgr) RequestSave(changes FieldChanges) error {
 	done := make(chan error)
-	wr := writeRequest{done: done}
-	w.writeRequests <- wr
+	fscm.writeRequests <- writeRequest{errorReturn: done, changes: changes}
 	return <-done
 }
 
-func (fs *MeasurementFieldSet) saveWriter() {
-	defer fs.writer.wg.Done()
-	// Block until someone modifies the MeasurementFieldSet and
-	// it needs to be written to disk.
-	for req, ok := <-fs.writer.writeRequests; ok; req, ok = <-fs.writer.writeRequests {
-		fs.writeToFile(req)
+func (fscm *measurementFieldSetChangeMgr) SaveWriter() {
+	defer fscm.wg.Done()
+	// Block until someone modifies the MeasurementFieldSet, and
+	// it needs to be written to disk. Exit when the channel is closed
+	for wr, ok := <-fscm.writeRequests; ok; wr, ok = <-fscm.writeRequests {
+		fscm.appendToChangesFile(wr)
 	}
 }
 
-// writeToFile: Write the new index to a temp file and rename when it's sync'd
-func (fs *MeasurementFieldSet) writeToFile(first writeRequest) {
-	var err error
-	// Put the errorChannel on which we blocked into a slice to allow more invocations
-	// to share the return code from the file write
-	errorChannels := []errorChannel{first.done}
-	defer func() {
-		for _, c := range errorChannels {
-			c <- err
-			close(c)
-		}
-	}()
-	// Do some blocking IO operations before marshalling the in-memory index
-	// to allow other changes to it to be queued up and be captured in one
-	// write operation, in case we are under heavy field creation load
+// WriteToFile: Write the new index to a temp file and rename when it's sync'd
+// This locks the MeasurementFieldSet during the marshaling, the write, and the rename.
+func (fs *MeasurementFieldSet) WriteToFile() error {
 	path := fs.path + ".tmp"
 
 	// Open the temp file
 	fd, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_EXCL|os.O_SYNC, 0666)
 	if err != nil {
-		return
+		return fmt.Errorf("failed opening %s: %w", fs.path, err)
 	}
 	// Ensure temp file is cleaned up
 	defer func() {
-		if e := os.RemoveAll(path); err == nil {
-			err = e
+		if e := os.RemoveAll(path); err == nil && e != nil {
+			err = fmt.Errorf("failed removing temporary file %s: %w", path, e)
+		}
+		if e := os.RemoveAll(fs.changeMgr.changeFilePath); err == nil && e != nil {
+			err = fmt.Errorf("failed removing saved field changes - %s: %w", fs.changeMgr.changeFilePath, e)
 		}
 	}()
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
 	isEmpty, err := func() (isEmpty bool, err error) {
 		// ensure temp file closed before rename (for Windows)
 		defer func() {
-			if e := fd.Close(); err == nil {
-				err = e
+			if e := fd.Close(); err == nil && e != nil {
+				err = fmt.Errorf("closing %s: %w", path, e)
 			}
 		}()
 		if _, err = fd.Write(fieldsIndexMagicNumber); err != nil {
-			return true, err
+			return true, fmt.Errorf("failed writing magic number for %s: %w", path, err)
 		}
 
-		// Read all the pending new field and measurement write requests
-		// that will be captured in the marshaling of the in-memory copy
-		for {
-			select {
-			case ec := <-fs.writer.writeRequests:
-				errorChannels = append(errorChannels, ec.done)
-				continue
-			default:
-			}
-			break
-		}
 		// Lock, copy, and marshal the in-memory index
-		b, err := fs.marshalMeasurementFieldSet()
+		b, err := fs.marshalMeasurementFieldSetNoLock()
 		if err != nil {
-			return true, err
+			return true, fmt.Errorf("failed marshaling fields for %s: %w", fs.path, err)
 		}
 		if b == nil {
 			// No fields, file removed, all done
 			return true, nil
 		}
 		if _, err := fd.Write(b); err != nil {
-			return true, err
+			return true, fmt.Errorf("failed saving fields to %s: %w", path, err)
 		}
-		return false, fd.Sync()
+		return false, nil
 	}()
-	if err != nil || isEmpty {
+	if err != nil {
+		return err
+	} else if isEmpty {
+		// remove empty file
+		if err = os.RemoveAll(fs.path); err != nil {
+			return fmt.Errorf("cannot remove %s: %w", fs.path, err)
+		} else {
+			return nil
+		}
+	}
+
+	return fs.renameFileNoLock(path)
+}
+
+// appendToChangesFile: Write a change file for fields.idx
+// Only called in one Go proc, so does not need locking.
+func (fscm *measurementFieldSetChangeMgr) appendToChangesFile(first writeRequest) {
+	var err error = nil
+	// Put the errorChannel on which we blocked into a slice to allow more invocations
+	// to share the return code from the file write
+	errorChannels := []errorChannel{first.errorReturn}
+	changes := []FieldChanges{first.changes}
+	// On return, send the error to every go proc that send changes
+	defer func() {
+		for _, c := range errorChannels {
+			c <- err
+			close(c)
+		}
+	}()
+	log, end := logger.NewOperation(context.TODO(), fscm.logger, "saving field index changes", "MeasurementFieldSet")
+	defer end()
+	// Do some blocking IO operations before marshalling the changes,
+	// to allow other changes to be queued up and be captured in one
+	// write operation, in case we are under heavy field creation load
+	fscm.mu.Lock()
+	defer fscm.mu.Unlock()
+	fd, err := os.OpenFile(fscm.changeFilePath, os.O_CREATE|os.O_APPEND|os.O_SYNC|os.O_WRONLY, 0666)
+	if err != nil {
+		err = fmt.Errorf("opening %s: %w", fscm.changeFilePath, err)
+		log.Error("failed", zap.Error(err))
 		return
 	}
-	err = fs.renameFile(path)
-}
 
-// marshalMeasurementFieldSet: remove the fields.idx file if no fields
-// otherwise, copy the in-memory version into a protobuf to write to
-// disk
-func (fs *MeasurementFieldSet) marshalMeasurementFieldSet() ([]byte, error) {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	if len(fs.fields) == 0 {
-		// If no fields left, remove the fields index file
-		if err := os.RemoveAll(fs.path); err != nil {
-			return nil, err
+	// ensure file closed
+	defer errors2.Capture(&err, func() error {
+		if e := fd.Close(); e != nil {
+			e = fmt.Errorf("closing %s: %w", fd.Name(), e)
+			log.Error("failed", zap.Error(e))
+			return e
 		} else {
-			return nil, nil
+			return nil
+		}
+	})()
+
+	var fi os.FileInfo
+	if fi, err = fd.Stat(); err != nil {
+		err = fmt.Errorf("unable to get size of %s: %w", fd.Name(), err)
+		log.Error("failed", zap.Error(err))
+		return
+	} else if fi.Size() > fscm.changeFileSize {
+		// If we had a partial write last time, truncate the file to remove it.
+		if err = fd.Truncate(fscm.changeFileSize); err != nil {
+			err = fmt.Errorf("cannot truncate %s to last known good size of %d after incomplete write: %w", fd.Name(), fscm.changeFileSize, err)
+			log.Error("failed", zap.Error(err))
+			return
 		}
 	}
-	return fs.marshalMeasurementFieldSetNoLock()
-}
 
-func (fs *MeasurementFieldSet) renameFile(path string) error {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-
-	if err := file.RenameFile(path, fs.path); err != nil {
-		return err
+	// Read all the pending field and measurement write or delete
+	// requests
+	for {
+		select {
+		case wr := <-fscm.writeRequests:
+			changes = append(changes, wr.changes)
+			errorChannels = append(errorChannels, wr.errorReturn)
+			continue
+		default:
+		}
+		break
+	}
+	// marshal the slice of slices of field changes in size-prefixed protobuf
+	var b []byte
+	b, err = marshalFieldChanges(changes...)
+	if err != nil {
+		err = fmt.Errorf("error marshaling changes for %s: %w", fd.Name(), err)
+		log.Error("failed", zap.Error(err))
+		return
 	}
 
-	if err := file.SyncDir(filepath.Dir(fs.path)); err != nil {
-		return err
+	if _, err = fd.Write(b); err != nil {
+		err = fmt.Errorf("failed writing to %s: %w", fd.Name(), err)
+		log.Error("failed", zap.Error(err))
+		return
+	} else if fi, err = fd.Stat(); err != nil {
+		err = fmt.Errorf("unable to get final size of %s after appendation: %w", fd.Name(), err)
+		log.Error("failed", zap.Error(err))
+		return
+	} else {
+		fscm.changeFileSize = fi.Size()
+	}
+}
+
+func readSizePlusBuffer(r io.Reader, b []byte) ([]byte, error) {
+	var numBuf [bytesInInt64]byte
+
+	if _, err := r.Read(numBuf[:]); err != nil {
+		return nil, err
+	}
+	size := int(binary.LittleEndian.Uint64(numBuf[:]))
+	if cap(b) < size {
+		b = make([]byte, size)
+	}
+	_, err := io.ReadAtLeast(r, b, size)
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+func (fs *MeasurementFieldSet) renameFileNoLock(path string) error {
+	if err := file.RenameFile(path, fs.path); err != nil {
+		return fmt.Errorf("cannot rename %s to %s: %w", path, fs.path, err)
+	}
+
+	dir := filepath.Dir(fs.path)
+	if err := file.SyncDir(dir); err != nil {
+		return fmt.Errorf("cannot sync directory %s: %w", dir, err)
 	}
 
 	return nil
 }
 
+// marshalMeasurementFieldSetNoLock: remove the fields.idx file if no fields
+// otherwise, copy the in-memory version into a protobuf to write to
+// disk
 func (fs *MeasurementFieldSet) marshalMeasurementFieldSetNoLock() (marshalled []byte, err error) {
+	if len(fs.fields) == 0 {
+		// If no fields left, remove the fields index file
+		return nil, nil
+	}
+
 	pb := internal.MeasurementFieldSet{
 		Measurements: make([]*internal.MeasurementFields, 0, len(fs.fields)),
 	}
@@ -2031,48 +2352,202 @@ func (fs *MeasurementFieldSet) marshalMeasurementFieldSetNoLock() (marshalled []
 	}
 }
 
-func (fs *MeasurementFieldSet) load() error {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
+func marshalFieldChanges(changeSet ...FieldChanges) ([]byte, error) {
+	fcs := internal.FieldChangeSet{
+		Changes: nil,
+	}
+	for _, fc := range changeSet {
+		for _, f := range fc {
+			mfc := &internal.MeasurementFieldChange{
+				Measurement: f.Measurement,
+				Change:      internal.ChangeType(f.ChangeType),
+			}
+			if f.Field != nil {
+				mfc.Field = &internal.Field{
+					Name: []byte(f.Field.Name),
+					Type: int32(f.Field.Type),
+				}
+				fcs.Changes = append(fcs.Changes, mfc)
+			}
+		}
+	}
+	mo := proto.MarshalOptions{}
+	var numBuf [bytesInInt64]byte
+
+	b, err := mo.MarshalAppend(numBuf[:], &fcs)
+	binary.LittleEndian.PutUint64(b[0:bytesInInt64], uint64(len(b)-bytesInInt64))
+
+	if err != nil {
+		fields := make([]string, 0, len(fcs.Changes))
+		for _, fc := range changeSet {
+			for _, f := range fc {
+				fields = append(fields, fmt.Sprintf("%q.%q", f.Measurement, f.Field.Name))
+			}
+		}
+		return nil, fmt.Errorf("failed marshaling new fields - %s: %w", strings.Join(fields, ", "), err)
+	}
+	return b, nil
+}
+
+func (fs *MeasurementFieldSet) load() (rErr error) {
+	err := func() error {
+		fs.mu.Lock()
+		defer fs.mu.Unlock()
+
+		pb, err := fs.loadParseFieldIndexPB()
+		if err != nil {
+			return err
+		}
+		fs.fields = make(map[string]*MeasurementFields, len(pb.GetMeasurements()))
+		for _, measurement := range pb.GetMeasurements() {
+			fields := make(map[string]*Field, len(measurement.GetFields()))
+			for _, field := range measurement.GetFields() {
+				fields[string(field.GetName())] = &Field{Name: string(field.GetName()), Type: influxql.DataType(field.GetType())}
+			}
+			set := &MeasurementFields{}
+			set.fields.Store(fields)
+			fs.fields[string(measurement.GetName())] = set
+		}
+		return nil
+	}()
+
+	if err != nil {
+		return fmt.Errorf("failed loading field indices: %w", err)
+	}
+	return fs.ApplyChanges()
+}
+
+func (fs *MeasurementFieldSet) loadParseFieldIndexPB() (pb *internal.MeasurementFieldSet, rErr error) {
+	pb = &internal.MeasurementFieldSet{}
 
 	fd, err := os.Open(fs.path)
 	if os.IsNotExist(err) {
-		return nil
+		return pb, nil
 	} else if err != nil {
-		return err
+		err = fmt.Errorf("failed opening %s: %w", fs.path, err)
+		return nil, err
 	}
-	defer fd.Close()
+
+	defer errors2.Capture(&rErr, func() error {
+		if e := fd.Close(); e != nil {
+			return fmt.Errorf("failed closing %s: %w", fd.Name(), e)
+		} else {
+			return nil
+		}
+	})()
 
 	var magic [4]byte
 	if _, err := fd.Read(magic[:]); err != nil {
-		return err
+		err = fmt.Errorf("failed reading %s: %w", fs.path, err)
+		return nil, err
 	}
 
 	if !bytes.Equal(magic[:], fieldsIndexMagicNumber) {
-		return ErrUnknownFieldsFormat
+		return nil, fmt.Errorf("%q: %w", fs.path, ErrUnknownFieldsFormat)
 	}
 
-	var pb internal.MeasurementFieldSet
-	b, err := ioutil.ReadAll(fd)
+	b, err := io.ReadAll(fd)
+	if err != nil {
+		err = fmt.Errorf("failed reading %s: %w", fs.path, err)
+		return nil, err
+	}
+	if err = proto.Unmarshal(b, pb); err != nil {
+		err = fmt.Errorf("failed unmarshaling %s: %w", fs.path, err)
+		return nil, err
+	}
+	return pb, err
+}
+
+func (fscm *measurementFieldSetChangeMgr) loadAllFieldChanges(log *zap.Logger) (changes []FieldChanges, rErr error) {
+	var fcs FieldChanges
+
+	fscm.mu.Lock()
+	defer fscm.mu.Unlock()
+	fd, err := os.Open(fscm.changeFilePath)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		err = fmt.Errorf("failed opening %s: %w", fscm.changeFilePath, err)
+		log.Error("field index file of changes", zap.Error(err))
+		return nil, err
+	}
+	defer errors2.Capture(&rErr, func() error {
+		if e := fd.Close(); e != nil {
+			return fmt.Errorf("failed closing %s: %w", fd.Name(), e)
+		} else {
+			return nil
+		}
+	})()
+	for fcs, err = fscm.loadFieldChangeSet(fd); err == nil; fcs, err = fscm.loadFieldChangeSet(fd) {
+		changes = append(changes, fcs)
+	}
+	if errors.Is(err, io.EOF) {
+		return changes, nil
+	} else if errors.Is(err, io.ErrUnexpectedEOF) {
+		log.Warn("last entry was an incomplete write", zap.Error(err))
+		return changes, nil
+	} else {
+		log.Error("field index file of changes", zap.Error(err))
+		return nil, err
+	}
+}
+
+func (fscm *measurementFieldSetChangeMgr) loadFieldChangeSet(r io.Reader) (FieldChanges, error) {
+	var pb internal.FieldChangeSet
+
+	b, err := readSizePlusBuffer(r, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed reading %s: %w", fscm.changeFilePath, err)
+	}
+	if err := proto.Unmarshal(b, &pb); err != nil {
+		return nil, fmt.Errorf("failed unmarshalling %s: %w", fscm.changeFilePath, err)
+	}
+
+	fcs := make([]*FieldChange, 0, len(pb.Changes))
+
+	for _, fc := range pb.Changes {
+		fcs = append(fcs, &FieldChange{
+			FieldCreate: FieldCreate{
+				Measurement: fc.Measurement,
+				Field: &Field{
+					ID:   0,
+					Name: string(fc.Field.Name),
+					Type: influxql.DataType(fc.Field.Type),
+				},
+			},
+			ChangeType: ChangeType(fc.Change),
+		})
+	}
+	return fcs, nil
+}
+
+func (fs *MeasurementFieldSet) ApplyChanges() error {
+	log, end := logger.NewOperation(context.TODO(), fs.changeMgr.logger, "loading changes", "field indices")
+	defer end()
+	changes, err := fs.changeMgr.loadAllFieldChanges(log)
 	if err != nil {
 		return err
 	}
-
-	if err := proto.Unmarshal(b, &pb); err != nil {
-		return err
+	if len(changes) <= 0 {
+		return os.RemoveAll(fs.changeMgr.changeFilePath)
 	}
 
-	fs.fields = make(map[string]*MeasurementFields, len(pb.GetMeasurements()))
-	for _, measurement := range pb.GetMeasurements() {
-		fields := make(map[string]*Field, len(measurement.GetFields()))
-		for _, field := range measurement.GetFields() {
-			fields[string(field.GetName())] = &Field{Name: string(field.GetName()), Type: influxql.DataType(field.GetType())}
+	for _, fcs := range changes {
+		for _, fc := range fcs {
+			if fc.ChangeType == DeleteMeasurement {
+				fs.Delete(string(fc.Measurement))
+			} else {
+				mf := fs.CreateFieldsIfNotExists(fc.Measurement)
+				if err := mf.CreateFieldIfNotExists([]byte(fc.Field.Name), fc.Field.Type); err != nil {
+					err = fmt.Errorf("failed creating %q.%q: %w", fc.Measurement, fc.Field.Name, err)
+					log.Error("field creation", zap.Error(err))
+					return err
+				}
+			}
 		}
-		set := &MeasurementFields{}
-		set.fields.Store(fields)
-		fs.fields[string(measurement.GetName())] = set
 	}
-	return nil
+	return fs.WriteToFile()
 }
 
 // Field represents a series field. All of the fields must be hashable.
@@ -2081,6 +2556,18 @@ type Field struct {
 	Name string            `json:"name,omitempty"`
 	Type influxql.DataType `json:"type,omitempty"`
 }
+
+type FieldChange struct {
+	FieldCreate
+	ChangeType ChangeType
+}
+
+type ChangeType int
+
+const (
+	AddMeasurementField = ChangeType(internal.ChangeType_AddMeasurementField)
+	DeleteMeasurement   = ChangeType(internal.ChangeType_DeleteMeasurement)
+)
 
 // NewFieldKeysIterator returns an iterator that can be iterated over to
 // retrieve field keys.

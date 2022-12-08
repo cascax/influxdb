@@ -6,7 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"github.com/influxdata/influxdb/v2/predicate"
 	"math"
 	"math/rand"
 	"os"
@@ -140,6 +140,31 @@ func TestStore_CreateShard(t *testing.T) {
 
 	for _, index := range tsdb.RegisteredIndexes() {
 		t.Run(index, func(t *testing.T) { test(t, index) })
+	}
+}
+
+func TestStore_BadShard(t *testing.T) {
+	const errStr = "a shard open error"
+	indexes := tsdb.RegisteredIndexes()
+	for _, idx := range indexes {
+		func() {
+			s := MustOpenStore(t, idx)
+			defer require.NoErrorf(t, s.Close(), "closing store with index type: %s", idx)
+
+			sh := tsdb.NewTempShard(t, idx)
+			err := s.OpenShard(context.Background(), sh.Shard, false)
+			require.NoError(t, err, "opening temp shard")
+			defer require.NoError(t, sh.Close(), "closing temporary shard")
+
+			s.SetShardOpenErrorForTest(sh.ID(), errors.New(errStr))
+			err2 := s.OpenShard(context.Background(), sh.Shard, false)
+			require.Error(t, err2, "no error opening bad shard")
+			require.True(t, errors.Is(err2, tsdb.ErrPreviousShardFail{}), "exp: ErrPreviousShardFail, got: %v", err2)
+			require.EqualError(t, err2, "opening shard previously failed with: "+errStr)
+
+			// This should succeed with the force (and because opening an open shard automatically succeeds)
+			require.NoError(t, s.OpenShard(context.Background(), sh.Shard, true), "forced re-opening previously failing shard")
+		}()
 	}
 }
 
@@ -1243,6 +1268,21 @@ func TestStore_Sketches(t *testing.T) {
 		if got, exp := int(tsketch.Count()), tmeasurements; got-exp < -delta(tmeasurements) || got-exp > delta(tmeasurements) {
 			return fmt.Errorf("got measurement tombstone cardinality %d, expected ~%d", got, exp)
 		}
+
+		if mc, err := store.MeasurementsCardinality(context.Background(), "db"); err != nil {
+			return fmt.Errorf("unexpected error from MeasurementsCardinality: %w", err)
+		} else {
+			if mc < 0 {
+				return fmt.Errorf("MeasurementsCardinality returned < 0 (%v)", mc)
+			}
+			expMc := int64(sketch.Count() - tsketch.Count())
+			if expMc < 0 {
+				expMc = 0
+			}
+			if got, exp := int(mc), int(expMc); got-exp < -delta(exp) || got-exp > delta(exp) {
+				return fmt.Errorf("got measurement cardinality %d, expected ~%d", mc, exp)
+			}
+		}
 		return nil
 	}
 
@@ -1285,7 +1325,7 @@ func TestStore_Sketches(t *testing.T) {
 			return fmt.Errorf("[initial|re-open] %v", err)
 		}
 
-		// Delete half the the measurements data
+		// Delete half the measurements data
 		mnames, err := store.MeasurementNames(context.Background(), nil, "db", nil)
 		if err != nil {
 			return err
@@ -1316,6 +1356,33 @@ func TestStore_Sketches(t *testing.T) {
 		if err := checkCardinalities(store.Store, expS, expTS, expM, expTM); err != nil {
 			return fmt.Errorf("[initial|re-open|delete|re-open] %v", err)
 		}
+
+		// Now delete the rest of the measurements.
+		// This will cause the measurement tombstones to exceed the measurement cardinality for TSI.
+		mnames, err = store.MeasurementNames(context.Background(), nil, "db", nil)
+		if err != nil {
+			return err
+		}
+
+		for _, name := range mnames {
+			if err := store.DeleteSeries(context.Background(), "db", []influxql.Source{&influxql.Measurement{Name: string(name)}}, nil); err != nil {
+				return err
+			}
+		}
+
+		// Check cardinalities. In this case, the indexes behave differently.
+		expS, expTS, expM, expTM = 80, 159, 5, 10
+		/*
+			if index == inmem.IndexName {
+				expS, expTS, expM, expTM = 80, 80, 5, 5
+			}
+		*/
+
+		// Check cardinalities - tombstones should be in
+		if err := checkCardinalities(store.Store, expS, expTS, expM, expTM); err != nil {
+			return fmt.Errorf("[initial|re-open|delete] %v", err)
+		}
+
 		return nil
 	}
 
@@ -1813,7 +1880,7 @@ func TestStore_MeasurementNames_ConcurrentDropShard(t *testing.T) {
 							return
 						}
 						time.Sleep(500 * time.Microsecond)
-						if err := sh.Open(context.Background()); err != nil {
+						if err := s.OpenShard(context.Background(), sh, false); err != nil {
 							errC <- err
 							return
 						}
@@ -1898,7 +1965,7 @@ func TestStore_TagKeys_ConcurrentDropShard(t *testing.T) {
 							return
 						}
 						time.Sleep(500 * time.Microsecond)
-						if err := sh.Open(context.Background()); err != nil {
+						if err := s.OpenShard(context.Background(), sh, false); err != nil {
 							errC <- err
 							return
 						}
@@ -1989,7 +2056,7 @@ func TestStore_TagValues_ConcurrentDropShard(t *testing.T) {
 							return
 						}
 						time.Sleep(500 * time.Microsecond)
-						if err := sh.Open(context.Background()); err != nil {
+						if err := s.OpenShard(context.Background(), sh, false); err != nil {
 							errC <- err
 							return
 						}
@@ -2056,6 +2123,58 @@ func TestStore_TagValues_ConcurrentDropShard(t *testing.T) {
 		if err := <-errC; err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestStore_DeleteByPredicate(t *testing.T) {
+	test := func(t *testing.T, index string) error {
+		s := MustOpenStore(t, index)
+		defer s.Close()
+
+		s.MustCreateShardWithData("db0", "rp0", 0,
+			`cpu,host=serverA value=1  0`,
+			`cpu,region=west value=3 20`,
+			`cpu,secret=foo value=5 30`,
+			`mem,secret=foo value=1 30`,
+			`disk value=4 30`,
+		)
+
+		p, err := predicate.Parse(`_measurement="cpu"`)
+		if err != nil {
+			return err
+		}
+
+		pred, err := predicate.New(p)
+		if err != nil {
+			return err
+		}
+
+		expr, err := influxql.ParseExpr(`_measurement="cpu"`)
+		if err != nil {
+			return err
+		}
+
+		err = s.DeleteSeriesWithPredicate(context.Background(), "db0", math.MinInt, math.MaxInt, pred, expr)
+		if err != nil {
+			return err
+		}
+
+		names, err := s.MeasurementNames(context.Background(), query.OpenAuthorizer, "db0", nil)
+		if err != nil {
+			return err
+		}
+
+		require.Equal(t, 2, len(names), "expected cpu to be deleted, leaving 2 measurements")
+
+		return nil
+	}
+
+	for _, index := range tsdb.RegisteredIndexes() {
+		t.Run(index, func(t *testing.T) {
+			if err := test(t, index); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -2271,7 +2390,7 @@ type Store struct {
 func NewStore(tb testing.TB, index string) *Store {
 	tb.Helper()
 
-	path, err := ioutil.TempDir("", "influxdb-tsdb-")
+	path, err := os.MkdirTemp("", "influxdb-tsdb-")
 	if err != nil {
 		panic(err)
 	}

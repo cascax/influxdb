@@ -16,6 +16,7 @@ import (
 	"github.com/influxdata/influxdb/v2/models"
 	"github.com/influxdata/influxdb/v2/tsdb"
 	_ "github.com/influxdata/influxdb/v2/tsdb/engine"
+	"github.com/influxdata/influxdb/v2/tsdb/engine/tsm1"
 	_ "github.com/influxdata/influxdb/v2/tsdb/index/tsi1"
 	"github.com/influxdata/influxdb/v2/v1/coordinator"
 	"github.com/influxdata/influxdb/v2/v1/services/meta"
@@ -53,11 +54,10 @@ type Engine struct {
 	retentionService  *retention.Service
 	precreatorService *precreator.Service
 
-	defaultMetricLabels prometheus.Labels
-
 	writePointsValidationEnabled bool
 
-	logger *zap.Logger
+	logger          *zap.Logger
+	metricsDisabled bool
 }
 
 // Option provides a set
@@ -69,8 +69,15 @@ func WithMetaClient(c MetaClient) Option {
 	}
 }
 
+func WithMetricsDisabled(m bool) Option {
+	return func(e *Engine) {
+		e.metricsDisabled = m
+	}
+}
+
 type MetaClient interface {
 	CreateDatabaseWithRetentionPolicy(name string, spec *meta.RetentionPolicySpec) (*meta.DatabaseInfo, error)
+	DropDatabase(name string) error
 	CreateShardGroup(database, policy string, timestamp time.Time) (*meta.ShardGroupInfo, error)
 	Database(name string) (di *meta.DatabaseInfo)
 	Databases() []meta.DatabaseInfo
@@ -108,11 +115,10 @@ func NewEngine(path string, c Config, options ...Option) *Engine {
 	c.Data.WALDir = filepath.Join(path, "wal")
 
 	e := &Engine{
-		config:              c,
-		path:                path,
-		defaultMetricLabels: prometheus.Labels{},
-		tsdbStore:           tsdb.NewStore(c.Data.Dir),
-		logger:              zap.NewNop(),
+		config:    c,
+		path:      path,
+		tsdbStore: tsdb.NewStore(c.Data.Dir),
+		logger:    zap.NewNop(),
 
 		writePointsValidationEnabled: true,
 	}
@@ -126,8 +132,9 @@ func NewEngine(path string, c Config, options ...Option) *Engine {
 	// Copy TSDB configuration.
 	e.tsdbStore.EngineOptions.EngineVersion = c.Data.Engine
 	e.tsdbStore.EngineOptions.IndexVersion = c.Data.Index
+	e.tsdbStore.EngineOptions.MetricsDisabled = e.metricsDisabled
 
-	pw := coordinator.NewPointsWriter(c.WriteTimeout)
+	pw := coordinator.NewPointsWriter(c.WriteTimeout, path)
 	pw.TSDBStore = e.tsdbStore
 	pw.MetaClient = e.metaClient
 	e.pointsWriter = pw
@@ -163,7 +170,13 @@ func (e *Engine) WithLogger(log *zap.Logger) {
 // PrometheusCollectors returns all the prometheus collectors associated with
 // the engine and its components.
 func (e *Engine) PrometheusCollectors() []prometheus.Collector {
-	return nil
+	var metrics []prometheus.Collector
+	metrics = append(metrics, tsm1.PrometheusCollectors()...)
+	metrics = append(metrics, coordinator.PrometheusCollectors()...)
+	metrics = append(metrics, tsdb.ShardCollectors()...)
+	metrics = append(metrics, tsdb.BucketCollectors()...)
+	metrics = append(metrics, retention.PrometheusCollectors()...)
+	return metrics
 }
 
 // Open opens the store and all underlying resources. It returns an error if
@@ -305,12 +318,16 @@ func (e *Engine) UpdateBucketRetentionPolicy(ctx context.Context, bucketID platf
 func (e *Engine) DeleteBucket(ctx context.Context, orgID, bucketID platform.ID) error {
 	span, _ := tracing.StartSpanFromContext(ctx)
 	defer span.Finish()
-	return e.tsdbStore.DeleteDatabase(bucketID.String())
+	err := e.tsdbStore.DeleteDatabase(bucketID.String())
+	if err != nil {
+		return err
+	}
+	return e.metaClient.DropDatabase(bucketID.String())
 }
 
 // DeleteBucketRangePredicate deletes data within a bucket from the storage engine. Any data
 // deleted must be in [min, max], and the key must match the predicate if provided.
-func (e *Engine) DeleteBucketRangePredicate(ctx context.Context, orgID, bucketID platform.ID, min, max int64, pred influxdb.Predicate) error {
+func (e *Engine) DeleteBucketRangePredicate(ctx context.Context, orgID, bucketID platform.ID, min, max int64, pred influxdb.Predicate, measurement influxql.Expr) error {
 	span, _ := tracing.StartSpanFromContext(ctx)
 	defer span.Finish()
 
@@ -319,7 +336,7 @@ func (e *Engine) DeleteBucketRangePredicate(ctx context.Context, orgID, bucketID
 	if e.closing == nil {
 		return ErrEngineClosed
 	}
-	return e.tsdbStore.DeleteSeriesWithPredicate(ctx, bucketID.String(), min, max, pred)
+	return e.tsdbStore.DeleteSeriesWithPredicate(ctx, bucketID.String(), min, max, pred, measurement)
 }
 
 // RLockKVStore locks the KV store as well as the engine in preparation for doing a backup.

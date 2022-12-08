@@ -34,7 +34,7 @@ func marshalUser(u *influxdb.User) ([]byte, error) {
 	return v, nil
 }
 
-func (s *Store) uniqueUserName(ctx context.Context, tx kv.Tx, uname string) error {
+func (s *Store) uniqueUserName(tx kv.Tx, uname string) error {
 
 	idx, err := tx.Bucket(userIndex)
 	if err != nil {
@@ -53,6 +53,26 @@ func (s *Store) uniqueUserName(ctx context.Context, tx kv.Tx, uname string) erro
 	}
 
 	// any other error is some sort of internal server error
+	return ErrUnprocessableUser(err)
+}
+
+func (s *Store) uniqueUserID(tx kv.Tx, id platform.ID) error {
+	encodedID, _ := id.Encode()
+
+	b, err := tx.Bucket(userBucket)
+	if err != nil {
+		return err
+	}
+
+	_, err = b.Get(encodedID)
+	if kv.IsNotFound(err) {
+		return nil
+	}
+
+	if err == nil {
+		return UserIDAlreadyExistsError(id.String())
+	}
+
 	return ErrUnprocessableUser(err)
 }
 
@@ -102,16 +122,10 @@ func (s *Store) GetUserByName(ctx context.Context, tx kv.Tx, n string) (*influxd
 }
 
 func (s *Store) ListUsers(ctx context.Context, tx kv.Tx, opt ...influxdb.FindOptions) ([]*influxdb.User, error) {
-	// if we dont have any options it would be irresponsible to just give back all users in the system
 	if len(opt) == 0 {
-		opt = append(opt, influxdb.FindOptions{
-			Limit: influxdb.DefaultPageSize,
-		})
+		opt = append(opt, influxdb.FindOptions{})
 	}
 	o := opt[0]
-	if o.Limit > influxdb.MaxPageSize || o.Limit == 0 {
-		o.Limit = influxdb.MaxPageSize
-	}
 
 	b, err := tx.Bucket(userBucket)
 	if err != nil {
@@ -152,7 +166,7 @@ func (s *Store) ListUsers(ctx context.Context, tx kv.Tx, opt ...influxdb.FindOpt
 
 		us = append(us, u)
 
-		if len(us) >= o.Limit {
+		if o.Limit != 0 && len(us) >= o.Limit {
 			break
 		}
 	}
@@ -170,7 +184,11 @@ func (s *Store) CreateUser(ctx context.Context, tx kv.Tx, u *influxdb.User) erro
 		return InvalidUserIDError(err)
 	}
 
-	if err := s.uniqueUserName(ctx, tx, u.Name); err != nil {
+	// Verify that both the provided username and user ID are not already in-use
+	if err := s.uniqueUserName(tx, u.Name); err != nil {
+		return err
+	}
+	if err := s.uniqueUserID(tx, u.ID); err != nil {
 		return err
 	}
 
@@ -212,7 +230,7 @@ func (s *Store) UpdateUser(ctx context.Context, tx kv.Tx, id platform.ID, upd in
 	}
 
 	if upd.Name != nil && *upd.Name != u.Name {
-		if err := s.uniqueUserName(ctx, tx, *upd.Name); err != nil {
+		if err := s.uniqueUserName(tx, *upd.Name); err != nil {
 			return nil, err
 		}
 

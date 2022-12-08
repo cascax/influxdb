@@ -33,7 +33,7 @@ type table struct {
 
 	cancelled, used int32
 	cache           *tagsCache
-	alloc           *memory.Allocator
+	alloc           memory.Allocator
 }
 
 func newTable(
@@ -43,7 +43,7 @@ func newTable(
 	cols []flux.ColMeta,
 	defs [][]byte,
 	cache *tagsCache,
-	alloc *memory.Allocator,
+	alloc memory.Allocator,
 ) table {
 	return table{
 		done:   done,
@@ -128,7 +128,7 @@ func (t *table) allocateBuffer(l int) *colReader {
 		t.colBufs = &colReader{
 			key:     t.key,
 			colMeta: t.cols,
-			cols:    make([]array.Interface, len(t.cols)),
+			cols:    make([]array.Array, len(t.cols)),
 		}
 	}
 	t.colBufs.refCount = 1
@@ -141,7 +141,7 @@ type colReader struct {
 
 	key     flux.GroupKey
 	colMeta []flux.ColMeta
-	cols    []array.Interface
+	cols    []array.Array
 	l       int
 }
 

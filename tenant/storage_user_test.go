@@ -27,6 +27,19 @@ func TestUser(t *testing.T) {
 		}
 	}
 
+	over20Setup := func(t *testing.T, store *tenant.Store, tx kv.Tx) {
+		for i := 1; i <= 22; i++ {
+			err := store.CreateUser(context.Background(), tx, &influxdb.User{
+				ID:     platform.ID(i),
+				Name:   fmt.Sprintf("user%d", i),
+				Status: "active",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
 	st := []struct {
 		name    string
 		setup   func(*testing.T, *tenant.Store, kv.Tx)
@@ -56,6 +69,24 @@ func TestUser(t *testing.T) {
 				}
 				if !reflect.DeepEqual(users, expected) {
 					t.Fatalf("expected identical users: \n%+v\n%+v", users, expected)
+				}
+
+				// Test that identical name causes an error
+				err = store.CreateUser(context.Background(), tx, &influxdb.User{
+					ID:   platform.ID(11), // Unique ID
+					Name: "user1",         // Non-unique name
+				})
+				if err == nil {
+					t.Fatal("expected error on creating user with identical username")
+				}
+
+				// Test that identical ID causes an error
+				err = store.CreateUser(context.Background(), tx, &influxdb.User{
+					ID:   platform.ID(1), // Non-unique ID
+					Name: "user11",       // Unique name
+				})
+				if err == nil {
+					t.Fatal("expected error on creating user with identical ID")
 				}
 			},
 		},
@@ -144,6 +175,20 @@ func TestUser(t *testing.T) {
 				}
 				if !reflect.DeepEqual(users, expected[3:]) {
 					t.Fatalf("expected identical users with limit: \n%+v\n%+v", users, expected[3:])
+				}
+			},
+		},
+		{
+			name:  "listOver20",
+			setup: over20Setup,
+			results: func(t *testing.T, store *tenant.Store, tx kv.Tx) {
+				users, err := store.ListUsers(context.Background(), tx)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if len(users) != 22 {
+					t.Fatalf("expected 10 users got: %d", len(users))
 				}
 			},
 		},

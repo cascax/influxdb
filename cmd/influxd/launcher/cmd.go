@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
+	"strings"
 	"time"
 
 	"github.com/influxdata/influxdb/v2/bolt"
@@ -14,22 +14,23 @@ import (
 	"github.com/influxdata/influxdb/v2/kit/cli"
 	"github.com/influxdata/influxdb/v2/kit/signals"
 	influxlogger "github.com/influxdata/influxdb/v2/logger"
-	"github.com/influxdata/influxdb/v2/nats"
 	"github.com/influxdata/influxdb/v2/pprof"
 	"github.com/influxdata/influxdb/v2/sqlite"
 	"github.com/influxdata/influxdb/v2/storage"
 	"github.com/influxdata/influxdb/v2/v1/coordinator"
 	"github.com/influxdata/influxdb/v2/vault"
-	natsserver "github.com/nats-io/gnatsd/server"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"go.uber.org/zap/zapcore"
 )
 
-const (
-	// Max Integer
-	MaxInt = 1<<uint(strconv.IntSize-1) - 1
-)
+func errInvalidFlags(flags []string, configFile string) error {
+	return fmt.Errorf(
+		"error: found flags from an InfluxDB 1.x configuration in config file at %s - see https://docs.influxdata.com/influxdb/latest/reference/config-options/ for flags supported on this version of InfluxDB: %s",
+		configFile,
+		strings.Join(flags, ","),
+	)
+}
 
 // NewInfluxdCommand constructs the root of the influxd CLI, along with a `run` subcommand.
 // The `run` subcommand is set as the default to execute.
@@ -44,6 +45,11 @@ func NewInfluxdCommand(ctx context.Context, v *viper.Viper) (*cobra.Command, err
 	cmd, err := cli.NewCommand(o.Viper, &prog)
 	if err != nil {
 		return nil, err
+	}
+
+	// Error out if invalid flags are found in the config file. This may indicate trying to launch 2.x using a 1.x config.
+	if invalidFlags := invalidFlags(v); len(invalidFlags) > 0 {
+		return nil, errInvalidFlags(invalidFlags, v.ConfigFileUsed())
 	}
 
 	runCmd := &cobra.Command{
@@ -65,6 +71,17 @@ func NewInfluxdCommand(ctx context.Context, v *viper.Viper) (*cobra.Command, err
 	cmd.AddCommand(printCmd)
 
 	return cmd, nil
+}
+
+func invalidFlags(v *viper.Viper) []string {
+	var invalid []string
+	for _, k := range v.AllKeys() {
+		if inOneDotExFlagsList(k) {
+			invalid = append(invalid, k)
+		}
+	}
+
+	return invalid
 }
 
 func setCmdDescriptions(cmd *cobra.Command) {
@@ -136,6 +153,8 @@ type InfluxdOpts struct {
 	SecretStore string
 	VaultConfig vault.Config
 
+	InstanceID string
+
 	HttpBindAddress       string
 	HttpReadHeaderTimeout time.Duration
 	HttpReadTimeout       time.Duration
@@ -170,6 +189,8 @@ type InfluxdOpts struct {
 	StorageConfig storage.Config
 
 	Viper *viper.Viper
+
+	HardeningEnabled bool
 }
 
 // NewOpts constructs options with default values.
@@ -207,19 +228,21 @@ func NewOpts(viper *viper.Viper) *InfluxdOpts {
 		StoreType:   DiskStore,
 		SecretStore: BoltStore,
 
-		NatsPort:            nats.RandomPort,
-		NatsMaxPayloadBytes: natsserver.MAX_PAYLOAD_SIZE,
+		NatsPort:            0,
+		NatsMaxPayloadBytes: 0,
 
 		NoTasks: false,
 
 		ConcurrencyQuota:                1024,
 		InitialMemoryBytesQuotaPerQuery: 0,
-		MemoryBytesQuotaPerQuery:        MaxInt,
+		MemoryBytesQuotaPerQuery:        0,
 		MaxMemoryBytes:                  0,
 		QueueSize:                       1024,
 
 		Testing:                 false,
 		TestingAlwaysAllowSetup: false,
+
+		HardeningEnabled: false,
 	}
 }
 
@@ -454,6 +477,12 @@ func (o *InfluxdOpts) BindCliOpts() []cli.Opt {
 			Flag:  "feature-flags",
 			Desc:  "feature flag overrides",
 		},
+		{
+			DestP:   &o.InstanceID,
+			Flag:    "instance-id",
+			Default: "",
+			Desc:    "add an instance id for replications to prevent collisions and allow querying by edge node",
+		},
 
 		// storage configuration
 		{
@@ -576,14 +605,16 @@ func (o *InfluxdOpts) BindCliOpts() []cli.Opt {
 		{
 			DestP:   &o.NatsPort,
 			Flag:    "nats-port",
-			Desc:    fmt.Sprintf("Port that should be bound by the NATS streaming server. A value of %d will cause a random port to be selected.", nats.RandomPort),
+			Desc:    "deprecated: nats has been replaced",
 			Default: o.NatsPort,
+			Hidden:  true,
 		},
 		{
 			DestP:   &o.NatsMaxPayloadBytes,
 			Flag:    "nats-max-payload-bytes",
-			Desc:    "The maximum number of bytes allowed in a NATS message payload.",
+			Desc:    "deprecated: nats has been replaced",
 			Default: o.NatsMaxPayloadBytes,
+			Hidden:  true,
 		},
 
 		// Pprof config
@@ -608,5 +639,67 @@ func (o *InfluxdOpts) BindCliOpts() []cli.Opt {
 			Default: o.UIDisabled,
 			Desc:    "Disable the InfluxDB UI",
 		},
+
+		// hardening options
+		// --hardening-enabled is meant to enable all hardending
+		// options in one go. Today it enables the IP validator for
+		// flux and pkger templates HTTP requests. In the future,
+		// --hardening-enabled might be used to enable other security
+		// features, at which point we can add per-feature flags so
+		// that users can either opt into all features
+		// (--hardening-enabled) or to precisely the features they
+		// require. Since today there is but one feature, there is no
+		// need to introduce --hardening-ip-validation-enabled (or
+		// similar).
+		{
+			DestP:   &o.HardeningEnabled,
+			Flag:    "hardening-enabled",
+			Default: o.HardeningEnabled,
+			Desc:    "enable hardening options (disallow private IPs within flux and templates HTTP requests)",
+		},
 	}
+}
+
+var (
+	oneDotExFlagsList = []string{
+		// "reporting-disabled" is valid in both 1x and 2x configs
+		"bind-address", // global setting is called "http-bind-address" on 2x
+
+		// Remaining flags, when parsed from a 1.x config file, will be in sub-sections prefixed by these headers:
+		"collectd.",
+		"continuous_queries.",
+		"coordinator.",
+		"data.",
+		"graphite.",
+		"http.",
+		"logging.",
+		"meta.",
+		"monitor.",
+		"opentsdb.",
+		"retention.",
+		"shard-precreation.",
+		"subscriber.",
+		"tls.",
+		"udp.",
+	}
+)
+
+// compareFlags checks if a given flag from the read configuration matches one from the list. If the value from the list
+// ends in a ".", the given flag is check for that prefix. Otherwise, the flag is checked for equality.
+func compareFlags(key, fromList string) bool {
+	if strings.HasSuffix(fromList, ".") {
+		return strings.HasPrefix(key, fromList)
+	}
+
+	return strings.EqualFold(key, fromList)
+}
+
+func inOneDotExFlagsList(key string) bool {
+	for _, f := range oneDotExFlagsList {
+		if compareFlags(key, f) {
+			return true
+		}
+	}
+
+	return false
 }

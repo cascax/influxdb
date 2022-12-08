@@ -8,6 +8,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/influxdata/flux"
 	"github.com/influxdata/flux/dependencies/dependenciestest"
+	"github.com/influxdata/flux/dependency"
 	"github.com/influxdata/flux/execute"
 	"github.com/influxdata/flux/execute/executetest"
 	"github.com/influxdata/flux/memory"
@@ -37,27 +38,27 @@ func (mockTableIterator) Statistics() cursors.CursorStats {
 type mockReader struct {
 }
 
-func (mockReader) ReadFilter(ctx context.Context, spec query.ReadFilterSpec, alloc *memory.Allocator) (query.TableIterator, error) {
+func (mockReader) ReadFilter(ctx context.Context, spec query.ReadFilterSpec, alloc memory.Allocator) (query.TableIterator, error) {
 	return &mockTableIterator{}, nil
 }
 
-func (mockReader) ReadGroup(ctx context.Context, spec query.ReadGroupSpec, alloc *memory.Allocator) (query.TableIterator, error) {
+func (mockReader) ReadGroup(ctx context.Context, spec query.ReadGroupSpec, alloc memory.Allocator) (query.TableIterator, error) {
 	return &mockTableIterator{}, nil
 }
 
-func (mockReader) ReadTagKeys(ctx context.Context, spec query.ReadTagKeysSpec, alloc *memory.Allocator) (query.TableIterator, error) {
+func (mockReader) ReadTagKeys(ctx context.Context, spec query.ReadTagKeysSpec, alloc memory.Allocator) (query.TableIterator, error) {
 	return &mockTableIterator{}, nil
 }
 
-func (mockReader) ReadTagValues(ctx context.Context, spec query.ReadTagValuesSpec, alloc *memory.Allocator) (query.TableIterator, error) {
+func (mockReader) ReadTagValues(ctx context.Context, spec query.ReadTagValuesSpec, alloc memory.Allocator) (query.TableIterator, error) {
 	return &mockTableIterator{}, nil
 }
 
-func (mockReader) ReadWindowAggregate(ctx context.Context, spec query.ReadWindowAggregateSpec, alloc *memory.Allocator) (query.TableIterator, error) {
+func (mockReader) ReadWindowAggregate(ctx context.Context, spec query.ReadWindowAggregateSpec, alloc memory.Allocator) (query.TableIterator, error) {
 	return &mockTableIterator{}, nil
 }
 
-func (mockReader) ReadSeriesCardinality(ctx context.Context, spec query.ReadSeriesCardinalitySpec, alloc *memory.Allocator) (query.TableIterator, error) {
+func (mockReader) ReadSeriesCardinality(ctx context.Context, spec query.ReadSeriesCardinalitySpec, alloc memory.Allocator) (query.TableIterator, error) {
 	return &mockTableIterator{}, nil
 }
 
@@ -89,12 +90,16 @@ func (a mockAdministration) Bounds() *execute.Bounds {
 	return a.StreamBounds
 }
 
-func (mockAdministration) Allocator() *memory.Allocator {
-	return &memory.Allocator{}
+func (mockAdministration) Allocator() memory.Allocator {
+	return memory.DefaultAllocator
 }
 
 func (mockAdministration) Parents() []execute.DatasetID {
 	return nil
+}
+
+func (mockAdministration) ParallelOpts() execute.ParallelOpts {
+	panic("implement me")
 }
 
 const (
@@ -127,7 +132,8 @@ func TestMetrics(t *testing.T) {
 	// This key/value pair added to the context will appear as a label in the prometheus histogram.
 	ctx := context.WithValue(context.Background(), labelKey, labelValue) //lint:ignore SA1029 this is a temporary ignore until we have time to create an appropriate type
 	// Injecting deps
-	ctx = deps.Inject(ctx)
+	ctx, span := dependency.Inject(ctx, deps)
+	defer span.Finish()
 	a := &mockAdministration{Ctx: ctx}
 	rfs := influxdb.ReadFilterSource(
 		execute.DatasetID(uuid.FromTime(time.Now())),
@@ -174,6 +180,7 @@ func TestReadWindowAggregateSource(t *testing.T) {
 
 	orgID, bucketID := platform2.ID(1), platform2.ID(2)
 	executetest.RunSourceHelper(t,
+		context.Background(),
 		[]*executetest.Table{
 			{
 				ColMeta: []flux.ColMeta{
@@ -218,7 +225,7 @@ func TestReadWindowAggregateSource(t *testing.T) {
 				},
 			}
 			reader := &mock.StorageReader{
-				ReadWindowAggregateFn: func(ctx context.Context, spec query.ReadWindowAggregateSpec, alloc *memory.Allocator) (query.TableIterator, error) {
+				ReadWindowAggregateFn: func(ctx context.Context, spec query.ReadWindowAggregateSpec, alloc memory.Allocator) (query.TableIterator, error) {
 					if want, got := orgID, spec.OrganizationID; want != got {
 						t.Errorf("unexpected organization id -want/+got:\n\t- %s\n\t+ %s", want, got)
 					}
@@ -278,7 +285,8 @@ func TestReadWindowAggregateSource(t *testing.T) {
 					Metrics: metrics,
 				},
 			}
-			ctx := deps.Inject(context.Background())
+			ctx, span := dependency.Inject(context.Background(), deps)
+			defer span.Finish()
 			ctx = query.ContextWithRequest(ctx, &query.Request{
 				OrganizationID: orgID,
 			})

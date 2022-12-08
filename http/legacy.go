@@ -10,13 +10,12 @@ func newLegacyBackend(b *APIBackend) *legacy.Backend {
 		HTTPErrorHandler: b.HTTPErrorHandler,
 		Logger:           b.Logger,
 		// TODO(sgc): /write support
-		//MaxBatchSizeBytes:     b.APIBackend.MaxBatchSizeBytes,
+		// MaxBatchSizeBytes:     b.APIBackend.MaxBatchSizeBytes,
 		AuthorizationService:  b.AuthorizationService,
 		OrganizationService:   b.OrganizationService,
 		BucketService:         b.BucketService,
 		PointsWriter:          b.PointsWriter,
 		DBRPMappingService:    b.DBRPService,
-		ProxyQueryService:     b.InfluxQLService,
 		InfluxqldQueryService: b.InfluxqldService,
 		WriteEventRecorder:    b.WriteEventRecorder,
 	}
@@ -34,6 +33,6 @@ func newLegacyHandler(b *legacy.Backend, config legacy.HandlerConfig) *legacy.Ha
 	influxqlBackend := legacy.NewInfluxQLBackend(b)
 	h.InfluxQLHandler = legacy.NewInfluxQLHandler(influxqlBackend, config)
 
-	h.PingHandler = legacy.NewPingHandler(config.Version)
+	h.PingHandler = legacy.NewPingHandler()
 	return h
 }

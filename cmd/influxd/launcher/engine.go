@@ -3,10 +3,11 @@ package launcher
 import (
 	"context"
 	"io"
-	"io/ioutil"
 	"os"
 	"sync"
 	"time"
+
+	"github.com/influxdata/influxql"
 
 	"github.com/influxdata/influxdb/v2"
 	"github.com/influxdata/influxdb/v2/http"
@@ -78,7 +79,7 @@ func (t *TemporaryEngine) Open(ctx context.Context) error {
 		return nil
 	}
 
-	path, err := ioutil.TempDir("", "e2e")
+	path, err := os.MkdirTemp("", "e2e")
 	if err != nil {
 		return err
 	}
@@ -120,8 +121,8 @@ func (t *TemporaryEngine) SeriesCardinality(ctx context.Context, bucketID platfo
 }
 
 // DeleteBucketRangePredicate will delete a bucket from the range and predicate.
-func (t *TemporaryEngine) DeleteBucketRangePredicate(ctx context.Context, orgID, bucketID platform.ID, min, max int64, pred influxdb.Predicate) error {
-	return t.engine.DeleteBucketRangePredicate(ctx, orgID, bucketID, min, max, pred)
+func (t *TemporaryEngine) DeleteBucketRangePredicate(ctx context.Context, orgID, bucketID platform.ID, min, max int64, pred influxdb.Predicate, measurement influxql.Expr) error {
+	return t.engine.DeleteBucketRangePredicate(ctx, orgID, bucketID, min, max, pred, measurement)
 }
 
 func (t *TemporaryEngine) CreateBucket(ctx context.Context, b *influxdb.Bucket) error {

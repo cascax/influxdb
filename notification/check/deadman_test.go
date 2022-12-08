@@ -7,6 +7,7 @@ import (
 	"github.com/influxdata/influxdb/v2/notification"
 	"github.com/influxdata/influxdb/v2/notification/check"
 	"github.com/influxdata/influxdb/v2/query/fluxlang"
+	itesting "github.com/influxdata/influxdb/v2/testing"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -72,8 +73,11 @@ check = {_check_id: "000000000000000a", _check_name: "moo", _type: "deadman", ta
 info = (r) => r["dead"]
 messageFn = (r) => "whoa! {r[\"dead\"]}"
 
-data |> v1["fieldsAsCols"]() |> monitor["deadman"](t: experimental["subDuration"](from: now(), d: 60s))
-    |> monitor["check"](data: check, messageFn: messageFn, info: info)`,
+data
+    |> v1["fieldsAsCols"]()
+    |> monitor["deadman"](t: experimental["subDuration"](from: now(), d: 60s))
+    |> monitor["check"](data: check, messageFn: messageFn, info: info)
+`,
 			},
 		},
 		{
@@ -124,8 +128,11 @@ check = {_check_id: "000000000000000a", _check_name: "moo", _type: "deadman", ta
 info = (r) => r["dead"]
 messageFn = (r) => "whoa! {r[\"dead\"]}"
 
-data |> v1["fieldsAsCols"]() |> monitor["deadman"](t: experimental["subDuration"](from: now(), d: 60s))
-    |> monitor["check"](data: check, messageFn: messageFn, info: info)`,
+data
+    |> v1["fieldsAsCols"]()
+    |> monitor["deadman"](t: experimental["subDuration"](from: now(), d: 60s))
+    |> monitor["check"](data: check, messageFn: messageFn, info: info)
+`,
 			},
 		},
 		{
@@ -176,8 +183,11 @@ check = {_check_id: "000000000000000a", _check_name: "moo", _type: "deadman", ta
 info = (r) => r["dead"]
 messageFn = (r) => "whoa! {r[\"dead\"]}"
 
-data |> v1["fieldsAsCols"]() |> monitor["deadman"](t: experimental["subDuration"](from: now(), d: 60s))
-    |> monitor["check"](data: check, messageFn: messageFn, info: info)`,
+data
+    |> v1["fieldsAsCols"]()
+    |> monitor["deadman"](t: experimental["subDuration"](from: now(), d: 60s))
+    |> monitor["check"](data: check, messageFn: messageFn, info: info)
+`,
 			},
 		},
 	}
@@ -186,7 +196,7 @@ data |> v1["fieldsAsCols"]() |> monitor["deadman"](t: experimental["subDuration"
 		t.Run(tt.name, func(t *testing.T) {
 			s, err := tt.args.deadman.GenerateFlux(fluxlang.DefaultService)
 			require.NoError(t, err)
-			assert.Equal(t, tt.wants.script, s)
+			assert.Equal(t, itesting.FormatFluxString(t, tt.wants.script), s)
 		})
 	}
 

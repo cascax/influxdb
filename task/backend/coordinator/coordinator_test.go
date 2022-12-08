@@ -8,11 +8,10 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"go.uber.org/zap/zaptest"
-
 	"github.com/influxdata/influxdb/v2/kit/platform"
 	"github.com/influxdata/influxdb/v2/task/backend/scheduler"
 	"github.com/influxdata/influxdb/v2/task/taskmodel"
+	"go.uber.org/zap/zaptest"
 )
 
 func Test_Coordinator_Executor_Methods(t *testing.T) {
@@ -21,12 +20,13 @@ func Test_Coordinator_Executor_Methods(t *testing.T) {
 		taskOne = &taskmodel.Task{ID: one}
 
 		runOne = &taskmodel.Run{
-			ID:           one,
-			TaskID:       one,
-			ScheduledFor: time.Now(),
+			ID:     one,
+			TaskID: one,
 		}
 
 		allowUnexported = cmp.AllowUnexported(executorE{}, schedulerC{}, SchedulableTask{})
+
+		scheduledTime = time.Now()
 	)
 
 	for _, test := range []struct {
@@ -46,7 +46,22 @@ func Test_Coordinator_Executor_Methods(t *testing.T) {
 			},
 			executor: &executorE{
 				calls: []interface{}{
-					manualRunCall{taskOne.ID, runOne.ID},
+					manualRunCall{taskOne.ID, runOne.ID, false},
+				},
+			},
+		},
+		{
+			name: "RunForcedScheduled",
+			call: func(t *testing.T, c *Coordinator) {
+				rr := runOne
+				rr.ScheduledFor = scheduledTime
+				if err := c.RunForced(context.Background(), taskOne, runOne); err != nil {
+					t.Errorf("expected nil error found %q", err)
+				}
+			},
+			executor: &executorE{
+				calls: []interface{}{
+					manualRunCall{taskOne.ID, runOne.ID, true},
 				},
 			},
 		},

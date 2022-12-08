@@ -32,7 +32,7 @@ type fakeQueryService struct {
 var _ query.AsyncQueryService = (*fakeQueryService)(nil)
 
 func makeAST(q string) lang.ASTCompiler {
-	pkg, err := runtime.ParseToJSON(q)
+	pkg, err := runtime.ParseToJSON(context.Background(), q)
 	if err != nil {
 		panic(err)
 	}
@@ -216,8 +216,7 @@ func newFakeResult() *fakeResult {
 	meta := []flux.ColMeta{{Label: "x", Type: flux.TInt}}
 	vals := []values.Value{values.NewInt(int64(1))}
 	gk := execute.NewGroupKey(meta, vals)
-	a := &memory.Allocator{}
-	b := execute.NewColListTableBuilder(gk, a)
+	b := execute.NewColListTableBuilder(gk, memory.DefaultAllocator)
 	i, _ := b.AddCol(meta[0])
 	b.AppendInt(i, int64(1))
 	t, err := b.Table()

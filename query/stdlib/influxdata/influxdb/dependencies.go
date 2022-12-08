@@ -4,8 +4,12 @@ import (
 	"context"
 
 	"github.com/influxdata/flux"
+	fluxfeature "github.com/influxdata/flux/dependencies/feature"
+	"github.com/influxdata/flux/dependencies/http"
 	influxdeps "github.com/influxdata/flux/dependencies/influxdb"
+	"github.com/influxdata/flux/dependencies/url"
 	"github.com/influxdata/influxdb/v2"
+	"github.com/influxdata/influxdb/v2/kit/feature"
 	"github.com/influxdata/influxdb/v2/kit/prom"
 	"github.com/influxdata/influxdb/v2/query"
 	"github.com/influxdata/influxdb/v2/storage"
@@ -62,7 +66,8 @@ type Dependencies struct {
 
 func (d Dependencies) Inject(ctx context.Context) context.Context {
 	ctx = d.FluxDeps.Inject(ctx)
-	return d.StorageDeps.Inject(ctx)
+	ctx = d.StorageDeps.Inject(ctx)
+	return InjectFlagsFromContext(ctx)
 }
 
 // PrometheusCollectors satisfies the prom.PrometheusCollector interface.
@@ -74,6 +79,15 @@ func (d Dependencies) PrometheusCollectors() []prometheus.Collector {
 	return collectors
 }
 
+type FluxDepOption func(*flux.Deps)
+
+func WithURLValidator(v url.Validator) FluxDepOption {
+	return func(d *flux.Deps) {
+		d.Deps.URLValidator = v
+		d.Deps.HTTPClient = http.NewDefaultClient(d.Deps.URLValidator)
+	}
+}
+
 func NewDependencies(
 	reader query.StorageReader,
 	writer storage.PointsWriter,
@@ -81,9 +95,16 @@ func NewDependencies(
 	orgSvc influxdb.OrganizationService,
 	ss influxdb.SecretService,
 	metricLabelKeys []string,
+	fluxopts ...FluxDepOption,
 ) (Dependencies, error) {
 	fdeps := flux.NewDefaultDependencies()
+	fdeps.Deps.HTTPClient = http.NewDefaultClient(url.PassValidator{})
 	fdeps.Deps.SecretService = query.FromSecretService(ss)
+	// apply fluxopts before assigning fdeps to deps (ie, before casting)
+	for _, opt := range fluxopts {
+		opt(&fdeps)
+	}
+
 	deps := Dependencies{FluxDeps: fdeps}
 	bucketLookupSvc := query.FromBucketService(bucketSvc)
 	orgLookupSvc := query.FromOrganizationService(orgSvc)
@@ -107,4 +128,27 @@ func NewDependencies(
 		return Dependencies{}, err
 	}
 	return deps, nil
+}
+
+type flags map[string]interface{}
+
+// InjectFlagsFromContext will take the idpe feature flags from
+// the context and wrap them in a flux feature flagger for the
+// flux engine.
+func InjectFlagsFromContext(ctx context.Context) context.Context {
+	flagger := flags(feature.FlagsFromContext(ctx))
+	return fluxfeature.Inject(ctx, flagger)
+}
+
+func (f flags) FlagValue(ctx context.Context, flag fluxfeature.Flag) interface{} {
+	v, ok := f[flag.Key()]
+	if !ok {
+		v = flag.Default()
+	}
+
+	// Flux uses int for intflag and influxdb uses int32 so convert here.
+	if i, ok := v.(int32); ok {
+		return int(i)
+	}
+	return v
 }

@@ -8,7 +8,6 @@ import (
 	"github.com/influxdata/influxdb/v2/influxql"
 	"github.com/influxdata/influxdb/v2/kit/cli"
 	"github.com/influxdata/influxdb/v2/kit/platform/errors"
-	"github.com/influxdata/influxdb/v2/query"
 	"github.com/influxdata/influxdb/v2/storage"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
@@ -33,18 +32,16 @@ type Backend struct {
 	BucketService         influxdb.BucketService
 	PointsWriter          storage.PointsWriter
 	DBRPMappingService    influxdb.DBRPMappingService
-	ProxyQueryService     query.ProxyQueryService
 	InfluxqldQueryService influxql.ProxyQueryService
 }
 
 // HandlerConfig provides configuration for the legacy handler.
 type HandlerConfig struct {
-	Version           string
 	DefaultRoutingKey string
 }
 
 func NewHandlerConfig() *HandlerConfig {
-	return &HandlerConfig{Version: influxdb.GetBuildInfo().Version}
+	return &HandlerConfig{}
 }
 
 // Opts returns the CLI options for use with kit/cli.

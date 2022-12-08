@@ -2,7 +2,7 @@ package http
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -45,10 +45,11 @@ func TestResourceListHandler(t *testing.T) {
 		string(influxdb.AnnotationsResourceType),
 		string(influxdb.RemotesResourceType),
 		string(influxdb.ReplicationsResourceType),
+		string(influxdb.InstanceResourceType),
 	}
 
 	resp := w.Result()
-	body, _ := ioutil.ReadAll(resp.Body)
+	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		t.Logf(string(body))
 		t.Errorf("unexpected status: %s", resp.Status)

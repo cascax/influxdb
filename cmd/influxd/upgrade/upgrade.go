@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"os/user"
@@ -509,7 +508,7 @@ func (o *optionsV1) validatePaths() error {
 	metaDb := filepath.Join(o.metaDir, "meta.db")
 	_, err := os.Stat(metaDb)
 	if err != nil {
-		return fmt.Errorf("1.x meta.db '%s' does not exist", metaDb)
+		return fmt.Errorf("1.x meta.db '%s' does not exist: %w", metaDb, err)
 	}
 
 	return nil
@@ -535,7 +534,7 @@ func (o *optionsV2) validatePaths() error {
 		if !fi.IsDir() {
 			return fmt.Errorf("upgraded 2.x engine path %q is not a directory", o.enginePath)
 		}
-		entries, err := ioutil.ReadDir(o.enginePath)
+		entries, err := os.ReadDir(o.enginePath)
 		if err != nil {
 			return fmt.Errorf("error checking contents of existing engine directory %q: %w", o.enginePath, err)
 		}

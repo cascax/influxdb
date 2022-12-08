@@ -9,15 +9,15 @@ import (
 
 	"github.com/golang/mock/gomock"
 	"github.com/influxdata/influxdb/v2"
-	"github.com/influxdata/influxdb/v2/kit/feature"
 	"github.com/influxdata/influxdb/v2/kit/platform"
 	"github.com/influxdata/influxdb/v2/remotes/mock"
 	"github.com/stretchr/testify/assert"
 	tmock "github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
-	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 )
+
+//go:generate go run github.com/golang/mock/mockgen -package mock -destination ../mock/service.go github.com/influxdata/influxdb/v2/remotes/transport RemoteConnectionService
 
 var (
 	orgStr         = "1234123412341234"
@@ -31,7 +31,7 @@ var (
 		OrgID:            *orgID,
 		Name:             "example",
 		RemoteURL:        "https://influxdb.cloud",
-		RemoteOrgID:      *remoteOrgID,
+		RemoteOrgID:      remoteOrgID,
 		AllowInsecureTLS: true,
 	}
 )
@@ -89,29 +89,6 @@ func TestRemoteConnectionHandler(t *testing.T) {
 		require.Equal(t, testConn, got)
 	})
 
-	t.Run("dry-run create happy path", func(t *testing.T) {
-		ts, svc := newTestServer(t)
-		defer ts.Close()
-
-		body := influxdb.CreateRemoteConnectionRequest{
-			OrgID:            testConn.OrgID,
-			Name:             testConn.Name,
-			RemoteURL:        testConn.RemoteURL,
-			RemoteToken:      "my super secret token",
-			RemoteOrgID:      testConn.RemoteOrgID,
-			AllowInsecureTLS: testConn.AllowInsecureTLS,
-		}
-
-		req := newTestRequest(t, "POST", ts.URL, &body)
-		q := req.URL.Query()
-		q.Add("validate", "true")
-		req.URL.RawQuery = q.Encode()
-
-		svc.EXPECT().ValidateNewRemoteConnection(gomock.Any(), body).Return(nil)
-
-		doTestRequest(t, req, http.StatusNoContent, false)
-	})
-
 	t.Run("get remote happy path", func(t *testing.T) {
 		ts, svc := newTestServer(t)
 		defer ts.Close()
@@ -154,34 +131,6 @@ func TestRemoteConnectionHandler(t *testing.T) {
 		var got influxdb.RemoteConnection
 		require.NoError(t, json.NewDecoder(res.Body).Decode(&got))
 		require.Equal(t, testConn, got)
-	})
-
-	t.Run("dry-run update happy path", func(t *testing.T) {
-		ts, svc := newTestServer(t)
-		defer ts.Close()
-
-		newToken := "a new even more secret token"
-		body := influxdb.UpdateRemoteConnectionRequest{RemoteToken: &newToken}
-
-		req := newTestRequest(t, "PATCH", ts.URL+"/"+id.String(), &body)
-		q := req.URL.Query()
-		q.Add("validate", "true")
-		req.URL.RawQuery = q.Encode()
-
-		svc.EXPECT().ValidateUpdatedRemoteConnection(gomock.Any(), *id, body).Return(nil)
-
-		doTestRequest(t, req, http.StatusNoContent, false)
-	})
-
-	t.Run("validate remote happy path", func(t *testing.T) {
-		ts, svc := newTestServer(t)
-		defer ts.Close()
-
-		req := newTestRequest(t, "POST", ts.URL+"/"+id.String()+"/validate", nil)
-
-		svc.EXPECT().ValidateRemoteConnection(gomock.Any(), *id).Return(nil)
-
-		doTestRequest(t, req, http.StatusNoContent, false)
 	})
 
 	t.Run("invalid remote IDs return 400", func(t *testing.T) {
@@ -230,19 +179,8 @@ func TestRemoteConnectionHandler(t *testing.T) {
 func newTestServer(t *testing.T) (*httptest.Server, *mock.MockRemoteConnectionService) {
 	ctrlr := gomock.NewController(t)
 	svc := mock.NewMockRemoteConnectionService(ctrlr)
-	server := annotatedTestServer(newRemoteConnectionHandler(zaptest.NewLogger(t), svc))
+	server := newRemoteConnectionHandler(zaptest.NewLogger(t), svc)
 	return httptest.NewServer(server), svc
-}
-
-func annotatedTestServer(serv http.Handler) http.Handler {
-	replicationFlag := feature.MakeFlag("", feature.ReplicationStreamBackend().Key(), "", true, 0, true)
-
-	return feature.NewHandler(
-		zap.NewNop(),
-		feature.DefaultFlagger(),
-		[]feature.Flag{replicationFlag},
-		serv,
-	)
 }
 
 func newTestRequest(t *testing.T, method, path string, body interface{}) *http.Request {

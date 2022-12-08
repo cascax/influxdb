@@ -3,11 +3,13 @@ package transport
 import (
 	"context"
 	"net/http"
+	"strings"
+
+	"github.com/influxdata/influxdb/v2/kv"
 
 	"github.com/go-chi/chi"
 	"github.com/go-chi/chi/middleware"
 	"github.com/influxdata/influxdb/v2"
-	"github.com/influxdata/influxdb/v2/kit/feature"
 	"github.com/influxdata/influxdb/v2/kit/platform"
 	"github.com/influxdata/influxdb/v2/kit/platform/errors"
 	kithttp "github.com/influxdata/influxdb/v2/kit/transport/http"
@@ -29,6 +31,11 @@ var (
 		Code: errors.EInvalid,
 		Msg:  "remote-connection ID is invalid",
 	}
+
+	errForeignKey = &errors.Error{
+		Code: errors.EInternal,
+		Msg:  "remote-connection cannot be deleted as a replication references it",
+	}
 )
 
 type RemoteConnectionService interface {
@@ -38,26 +45,14 @@ type RemoteConnectionService interface {
 	// CreateRemoteConnection registers a new remote InfluxDB connection.
 	CreateRemoteConnection(context.Context, influxdb.CreateRemoteConnectionRequest) (*influxdb.RemoteConnection, error)
 
-	// ValidateNewRemoteConnection validates that the given settings for a remote InfluxDB connection are usable,
-	// without persisting the connection info.
-	ValidateNewRemoteConnection(context.Context, influxdb.CreateRemoteConnectionRequest) error
-
 	// GetRemoteConnection returns metadata about the remote InfluxDB connection with the given ID.
 	GetRemoteConnection(context.Context, platform.ID) (*influxdb.RemoteConnection, error)
 
 	// UpdateRemoteConnection updates the settings for the remote InfluxDB connection with the given ID.
 	UpdateRemoteConnection(context.Context, platform.ID, influxdb.UpdateRemoteConnectionRequest) (*influxdb.RemoteConnection, error)
 
-	// ValidateUpdatedRemoteConnection validates that a remote InfluxDB connection is still usable after applying the
-	// given update, without persisting the new info.
-	ValidateUpdatedRemoteConnection(context.Context, platform.ID, influxdb.UpdateRemoteConnectionRequest) error
-
 	// DeleteRemoteConnection deletes all info for the remote InfluxDB connection with the given ID.
 	DeleteRemoteConnection(context.Context, platform.ID) error
-
-	// ValidateRemoteConnection checks that the remote InfluxDB connection with the given ID is still usable
-	// with its persisted settings.
-	ValidateRemoteConnection(context.Context, platform.ID) error
 }
 
 type RemoteConnectionHandler struct {
@@ -69,7 +64,9 @@ type RemoteConnectionHandler struct {
 	remotesService RemoteConnectionService
 }
 
-func NewInstrumentedRemotesHandler(log *zap.Logger, reg prometheus.Registerer, svc RemoteConnectionService) *RemoteConnectionHandler {
+func NewInstrumentedRemotesHandler(log *zap.Logger, reg prometheus.Registerer, kv kv.Store, svc RemoteConnectionService) *RemoteConnectionHandler {
+	// Collect telemetry.
+	svc = newTelemetryCollectingService(kv, svc)
 	// Collect metrics.
 	svc = newMetricCollectingService(reg, svc)
 	// Wrap logging.
@@ -92,7 +89,6 @@ func newRemoteConnectionHandler(log *zap.Logger, svc RemoteConnectionService) *R
 		middleware.Recoverer,
 		middleware.RequestID,
 		middleware.RealIP,
-		h.mwRemotesFlag, // Temporary, remove when feature flag for remote connections is perma-enabled.
 	)
 
 	r.Route("/", func(r chi.Router) {
@@ -103,7 +99,6 @@ func newRemoteConnectionHandler(log *zap.Logger, svc RemoteConnectionService) *R
 			r.Get("/", h.handleGetRemote)
 			r.Patch("/", h.handlePatchRemote)
 			r.Delete("/", h.handleDeleteRemote)
-			r.Post("/validate", h.handleValidateRemote)
 		})
 	})
 
@@ -113,19 +108,6 @@ func newRemoteConnectionHandler(log *zap.Logger, svc RemoteConnectionService) *R
 
 func (h *RemoteConnectionHandler) Prefix() string {
 	return prefixRemotes
-}
-
-func (h *RemoteConnectionHandler) mwRemotesFlag(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		flags := feature.FlagsFromContext(r.Context())
-
-		if flagVal, ok := flags[feature.ReplicationStreamBackend().Key()]; !ok || !flagVal.(bool) {
-			h.api.Respond(w, r, http.StatusNotFound, nil)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
 }
 
 func (h *RemoteConnectionHandler) handleGetRemotes(w http.ResponseWriter, r *http.Request) {
@@ -161,21 +143,10 @@ func (h *RemoteConnectionHandler) handleGetRemotes(w http.ResponseWriter, r *htt
 
 func (h *RemoteConnectionHandler) handlePostRemote(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	q := r.URL.Query()
 
-	validate := q.Get("validate") == "true"
 	var req influxdb.CreateRemoteConnectionRequest
 	if err := h.api.DecodeJSON(r.Body, &req); err != nil {
 		h.api.Err(w, r, err)
-		return
-	}
-
-	if validate {
-		if err := h.remotesService.ValidateNewRemoteConnection(ctx, req); err != nil {
-			h.api.Err(w, r, err)
-			return
-		}
-		h.api.Respond(w, r, http.StatusNoContent, nil)
 		return
 	}
 
@@ -210,21 +181,10 @@ func (h *RemoteConnectionHandler) handlePatchRemote(w http.ResponseWriter, r *ht
 	}
 
 	ctx := r.Context()
-	q := r.URL.Query()
 
-	validate := q.Get("validate") == "true"
 	var req influxdb.UpdateRemoteConnectionRequest
 	if err := h.api.DecodeJSON(r.Body, &req); err != nil {
 		h.api.Err(w, r, err)
-		return
-	}
-
-	if validate {
-		if err := h.remotesService.ValidateUpdatedRemoteConnection(ctx, *id, req); err != nil {
-			h.api.Err(w, r, err)
-			return
-		}
-		h.api.Respond(w, r, http.StatusNoContent, nil)
 		return
 	}
 
@@ -244,21 +204,11 @@ func (h *RemoteConnectionHandler) handleDeleteRemote(w http.ResponseWriter, r *h
 	}
 
 	if err := h.remotesService.DeleteRemoteConnection(r.Context(), *id); err != nil {
-		h.api.Err(w, r, err)
-		return
-	}
-	h.api.Respond(w, r, http.StatusNoContent, nil)
-}
-
-func (h *RemoteConnectionHandler) handleValidateRemote(w http.ResponseWriter, r *http.Request) {
-	id, err := platform.IDFromString(chi.URLParam(r, "id"))
-	if err != nil {
-		h.api.Err(w, r, errBadId)
-		return
-	}
-
-	if err := h.remotesService.ValidateRemoteConnection(r.Context(), *id); err != nil {
-		h.api.Err(w, r, err)
+		if strings.Contains(strings.ToLower(err.Error()), "foreign key constraint failed") {
+			h.api.Err(w, r, errForeignKey)
+		} else {
+			h.api.Err(w, r, err)
+		}
 		return
 	}
 	h.api.Respond(w, r, http.StatusNoContent, nil)

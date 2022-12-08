@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,6 +14,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	errors3 "github.com/influxdata/influxdb/v2/pkg/errors"
 
 	"github.com/influxdata/influxdb/v2"
 	"github.com/influxdata/influxdb/v2/influxql/query"
@@ -25,6 +26,7 @@ import (
 	"github.com/influxdata/influxdb/v2/pkg/estimator/hll"
 	"github.com/influxdata/influxdb/v2/pkg/limiter"
 	"github.com/influxdata/influxql"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -39,12 +41,6 @@ var (
 	// ErrMultipleIndexTypes is returned when trying to do deletes on a database with
 	// multiple index types.
 	ErrMultipleIndexTypes = errors.New("cannot delete data. DB contains shards using multiple indexes. Please convert all shards to use the same index type to delete data")
-)
-
-// Statistics gathered by the store.
-const (
-	statDatabaseSeries       = "numSeries"       // number of series in a database
-	statDatabaseMeasurements = "numMeasurements" // number of measurements in a database
 )
 
 // SeriesFileDirectory is the name of the directory containing series files for
@@ -75,6 +71,28 @@ func (d *databaseState) removeIndexType(indexType string) {
 // hasMultipleIndexTypes returns true if the database has multiple index types.
 func (d *databaseState) hasMultipleIndexTypes() bool { return d != nil && len(d.indexTypes) > 1 }
 
+type shardErrorMap struct {
+	mu          sync.Mutex
+	shardErrors map[uint64]error
+}
+
+func (se *shardErrorMap) setShardOpenError(shardID uint64, err error) {
+	se.mu.Lock()
+	defer se.mu.Unlock()
+	if err == nil {
+		delete(se.shardErrors, shardID)
+	} else {
+		se.shardErrors[shardID] = &ErrPreviousShardFail{error: fmt.Errorf("opening shard previously failed with: %w", err)}
+	}
+}
+
+func (se *shardErrorMap) shardError(shardID uint64) (error, bool) {
+	se.mu.Lock()
+	defer se.mu.Unlock()
+	oldErr, hasErr := se.shardErrors[shardID]
+	return oldErr, hasErr
+}
+
 // Store manages shards and indexes for databases.
 type Store struct {
 	mu                sync.RWMutex
@@ -87,6 +105,9 @@ type Store struct {
 	// Maintains a set of shards that are in the process of deletion.
 	// This prevents new shards from being created while old ones are being deleted.
 	pendingShardDeletes map[uint64]struct{}
+
+	// Maintains a set of shards that failed to open
+	badShards shardErrorMap
 
 	// Epoch tracker helps serialize writes and deletes that may conflict. It
 	// is stored by shard.
@@ -110,6 +131,7 @@ func NewStore(path string) *Store {
 		path:                path,
 		sfiles:              make(map[string]*SeriesFile),
 		pendingShardDeletes: make(map[uint64]struct{}),
+		badShards:           shardErrorMap{shardErrors: make(map[uint64]error)},
 		epochs:              make(map[uint64]*epochTracker),
 		EngineOptions:       NewEngineOptions(),
 		Logger:              zap.NewNop(),
@@ -126,16 +148,12 @@ func (s *Store) WithLogger(log *zap.Logger) {
 	}
 }
 
-// Statistics returns statistics for period monitoring.
-func (s *Store) Statistics(tags map[string]string) []models.Statistic {
-	s.mu.RLock()
-	shards := s.shardsSlice()
-	s.mu.RUnlock()
-
-	// Add all the series and measurements cardinality estimations.
+// CollectBucketMetrics sets prometheus metrics for each bucket
+func (s *Store) CollectBucketMetrics() {
+	// Collect all the bucket cardinality estimations
 	databases := s.Databases()
-	statistics := make([]models.Statistic, 0, len(databases))
 	for _, database := range databases {
+
 		log := s.Logger.With(logger.Database(database))
 		sc, err := s.SeriesCardinality(context.Background(), database)
 		if err != nil {
@@ -149,21 +167,48 @@ func (s *Store) Statistics(tags map[string]string) []models.Statistic {
 			continue
 		}
 
-		statistics = append(statistics, models.Statistic{
-			Name: "database",
-			Tags: models.StatisticTags{"database": database}.Merge(tags),
-			Values: map[string]interface{}{
-				statDatabaseSeries:       sc,
-				statDatabaseMeasurements: mc,
-			},
-		})
-	}
+		labels := prometheus.Labels{bucketLabel: database}
+		seriesCardinality := globalBucketMetrics.seriesCardinality.With(labels)
+		measureCardinality := globalBucketMetrics.measureCardinality.With(labels)
 
-	// Gather all statistics for all shards.
-	for _, shard := range shards {
-		statistics = append(statistics, shard.Statistics(tags)...)
+		seriesCardinality.Set(float64(sc))
+		measureCardinality.Set(float64(mc))
 	}
-	return statistics
+}
+
+var globalBucketMetrics = newAllBucketMetrics()
+
+const bucketSubsystem = "bucket"
+const bucketLabel = "bucket"
+
+type allBucketMetrics struct {
+	seriesCardinality  *prometheus.GaugeVec
+	measureCardinality *prometheus.GaugeVec
+}
+
+func newAllBucketMetrics() *allBucketMetrics {
+	labels := []string{bucketLabel}
+	return &allBucketMetrics{
+		seriesCardinality: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: storageNamespace,
+			Subsystem: bucketSubsystem,
+			Name:      "series_num",
+			Help:      "Gauge of series cardinality per bucket",
+		}, labels),
+		measureCardinality: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: storageNamespace,
+			Subsystem: bucketSubsystem,
+			Name:      "measurement_num",
+			Help:      "Gauge of measurement cardinality per bucket",
+		}, labels),
+	}
+}
+
+func BucketCollectors() []prometheus.Collector {
+	return []prometheus.Collector{
+		globalBucketMetrics.seriesCardinality,
+		globalBucketMetrics.measureCardinality,
+	}
 }
 
 func (s *Store) IndexBytes() int {
@@ -229,6 +274,14 @@ func (s *Store) Open(ctx context.Context) error {
 		}()
 	}
 
+	if !s.EngineOptions.MetricsDisabled {
+		s.wg.Add(1)
+		go func() {
+			s.wg.Done()
+			s.collectMetrics()
+		}()
+	}
+
 	return nil
 }
 
@@ -291,7 +344,7 @@ func (s *Store) loadShards(ctx context.Context) error {
 	var n int
 
 	// Determine how many shards we need to open by checking the store path.
-	dbDirs, err := ioutil.ReadDir(s.path)
+	dbDirs, err := os.ReadDir(s.path)
 	if err != nil {
 		return err
 	}
@@ -315,7 +368,7 @@ func (s *Store) loadShards(ctx context.Context) error {
 		}
 
 		// Load each retention policy within the database directory.
-		rpDirs, err := ioutil.ReadDir(dbPath)
+		rpDirs, err := os.ReadDir(dbPath)
 		if err != nil {
 			return err
 		}
@@ -337,7 +390,7 @@ func (s *Store) loadShards(ctx context.Context) error {
 				continue
 			}
 
-			shardDirs, err := ioutil.ReadDir(rpPath)
+			shardDirs, err := os.ReadDir(rpPath)
 			if err != nil {
 				return err
 			}
@@ -391,7 +444,7 @@ func (s *Store) loadShards(ctx context.Context) error {
 					shard.CompactionDisabled = s.EngineOptions.CompactionDisabled
 					shard.WithLogger(s.baseLogger)
 
-					err = shard.Open(ctx)
+					err = s.OpenShard(ctx, shard, false)
 					if err != nil {
 						log.Error("Failed to open shard", logger.Shard(shardID), zap.Error(err))
 						resC <- &res{err: fmt.Errorf("failed to open shard: %d: %s", shardID, err)}
@@ -530,6 +583,42 @@ func (s *Store) Shard(id uint64) *Shard {
 	return sh
 }
 
+type ErrPreviousShardFail struct {
+	error
+}
+
+func (e ErrPreviousShardFail) Unwrap() error {
+	return e.error
+}
+
+func (e ErrPreviousShardFail) Is(err error) bool {
+	_, sOk := err.(ErrPreviousShardFail)
+	_, pOk := err.(*ErrPreviousShardFail)
+	return sOk || pOk
+}
+
+func (e ErrPreviousShardFail) Error() string {
+	return e.error.Error()
+}
+
+func (s *Store) OpenShard(ctx context.Context, sh *Shard, force bool) error {
+	if sh == nil {
+		return errors.New("cannot open nil shard")
+	}
+	oldErr, bad := s.badShards.shardError(sh.ID())
+	if force || !bad {
+		err := sh.Open(ctx)
+		s.badShards.setShardOpenError(sh.ID(), err)
+		return err
+	} else {
+		return oldErr
+	}
+}
+
+func (s *Store) SetShardOpenErrorForTest(shardID uint64, err error) {
+	s.badShards.setShardOpenError(shardID, err)
+}
+
 // Shards returns a list of shards by id.
 func (s *Store) Shards(ids []uint64) []*Shard {
 	s.mu.RLock()
@@ -616,7 +705,7 @@ func (s *Store) CreateShard(ctx context.Context, database, retentionPolicy strin
 	shard.WithLogger(s.baseLogger)
 	shard.EnableOnOpen = enabled
 
-	if err := shard.Open(ctx); err != nil {
+	if err := s.OpenShard(ctx, shard, false); err != nil {
 		return err
 	}
 
@@ -750,6 +839,8 @@ func (s *Store) DeleteShard(shardID uint64) error {
 }
 
 // DeleteDatabase will close all shards associated with a database and remove the directory and files from disk.
+//
+// Returns nil if no database exists
 func (s *Store) DeleteDatabase(name string) error {
 	s.mu.RLock()
 	if _, ok := s.databases[name]; !ok {
@@ -851,7 +942,7 @@ func (s *Store) DeleteRetentionPolicy(database, name string) error {
 		return err
 	}
 
-	// Remove the retention policy folder from the the WAL.
+	// Remove the retention policy folder from the WAL.
 	if err := os.RemoveAll(filepath.Join(s.EngineOptions.Config.WALDir, database, name)); err != nil {
 		return err
 	}
@@ -1058,7 +1149,6 @@ func (s *Store) sketchesForDatabase(dbName string, getSketches func(*Shard) (est
 //
 // Cardinality is calculated exactly by unioning all shards' bitsets of series
 // IDs. The result of this method cannot be combined with any other results.
-//
 func (s *Store) SeriesCardinality(ctx context.Context, database string) (int64, error) {
 	s.mu.RLock()
 	shards := s.filterShards(byDatabase(database))
@@ -1138,7 +1228,11 @@ func (s *Store) MeasurementsCardinality(ctx context.Context, database string) (i
 	if err != nil {
 		return 0, err
 	}
-	return int64(ss.Count() - ts.Count()), nil
+	mc := int64(ss.Count() - ts.Count())
+	if mc < 0 {
+		mc = 0
+	}
+	return mc, nil
 }
 
 // MeasurementsSketches returns the sketches associated with the measurement
@@ -1243,7 +1337,7 @@ func (s *Store) ShardRelativePath(id uint64) (string, error) {
 
 // DeleteSeries loops through the local shards and deletes the series data for
 // the passed in series keys.
-func (s *Store) DeleteSeriesWithPredicate(ctx context.Context, database string, min, max int64, pred influxdb.Predicate) error {
+func (s *Store) DeleteSeriesWithPredicate(ctx context.Context, database string, min, max int64, pred influxdb.Predicate, measurement influxql.Expr) error {
 	s.mu.RLock()
 	if s.databases[database].hasMultipleIndexTypes() {
 		s.mu.RUnlock()
@@ -1263,7 +1357,7 @@ func (s *Store) DeleteSeriesWithPredicate(ctx context.Context, database string, 
 	// of series keys can be very memory intensive if run concurrently.
 	limit := limiter.NewFixed(1)
 
-	return s.walkShards(shards, func(sh *Shard) error {
+	return s.walkShards(shards, func(sh *Shard) (err error) {
 		if err := limit.Take(ctx); err != nil {
 			return err
 		}
@@ -1280,12 +1374,43 @@ func (s *Store) DeleteSeriesWithPredicate(ctx context.Context, database string, 
 			return err
 		}
 
+		measurementName := make([]byte, 0)
+
+		if measurement != nil {
+			if m, ok := measurement.(*influxql.BinaryExpr); ok {
+				rhs, ok := m.RHS.(*influxql.VarRef)
+				if ok {
+					measurementName = []byte(rhs.Val)
+					exists, err := sh.MeasurementExists(measurementName)
+					if err != nil {
+						return err
+					}
+					if !exists {
+						return nil
+					}
+				}
+			}
+		}
+
 		// Find matching series keys for each measurement.
 		mitr, err := index.MeasurementIterator()
 		if err != nil {
 			return err
 		}
-		defer mitr.Close()
+		defer errors3.Capture(&err, mitr.Close)()
+
+		deleteSeries := func(mm []byte) error {
+			sitr, err := index.MeasurementSeriesIDIterator(mm)
+			if err != nil {
+				return err
+			} else if sitr == nil {
+				return nil
+			}
+			defer errors3.Capture(&err, sitr.Close)()
+
+			itr := NewSeriesIteratorAdapter(sfile, NewPredicateSeriesIDIterator(sitr, sfile, pred))
+			return sh.DeleteSeriesRange(ctx, itr, min, max)
+		}
 
 		for {
 			mm, err := mitr.Next()
@@ -1295,19 +1420,14 @@ func (s *Store) DeleteSeriesWithPredicate(ctx context.Context, database string, 
 				break
 			}
 
-			if err := func() error {
-				sitr, err := index.MeasurementSeriesIDIterator(mm)
+			// If we are deleting within a measurement and have found a match, we can return after the delete.
+			if measurementName != nil && bytes.Equal(mm, measurementName) {
+				return deleteSeries(mm)
+			} else {
+				err := deleteSeries(mm)
 				if err != nil {
 					return err
-				} else if sitr == nil {
-					return nil
 				}
-				defer sitr.Close()
-
-				itr := NewSeriesIteratorAdapter(sfile, NewPredicateSeriesIDIterator(sitr, sfile, pred))
-				return sh.DeleteSeriesRange(ctx, itr, min, max)
-			}(); err != nil {
-				return err
 			}
 		}
 
@@ -1497,13 +1617,6 @@ func (s *Store) MeasurementNames(ctx context.Context, auth query.Authorizer, dat
 	default:
 	}
 	return is.MeasurementNamesByExpr(auth, cond)
-}
-
-// MeasurementSeriesCounts returns the number of measurements and series in all
-// the shards' indices.
-func (s *Store) MeasurementSeriesCounts(database string) (measuments int, series int) {
-	// TODO: implement me
-	return 0, 0
 }
 
 type TagKeys struct {
@@ -1940,6 +2053,19 @@ func (s *Store) monitorShards() {
 				}
 			}
 			s.mu.RUnlock()
+		}
+	}
+}
+
+func (s *Store) collectMetrics() {
+	t := time.NewTicker(10 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.closing:
+			return
+		case <-t.C:
+			s.CollectBucketMetrics()
 		}
 	}
 }

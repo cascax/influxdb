@@ -5,13 +5,12 @@ import (
 	"errors"
 	"time"
 
-	"go.uber.org/zap"
-
 	"github.com/influxdata/influxdb/v2/kit/platform"
 	"github.com/influxdata/influxdb/v2/task/backend/executor"
 	"github.com/influxdata/influxdb/v2/task/backend/middleware"
 	"github.com/influxdata/influxdb/v2/task/backend/scheduler"
 	"github.com/influxdata/influxdb/v2/task/taskmodel"
+	"go.uber.org/zap"
 )
 
 var _ middleware.Coordinator = (*Coordinator)(nil)
@@ -23,6 +22,7 @@ const DefaultLimit = 1000
 // Executor is an abstraction of the task executor with only the functions needed by the coordinator
 type Executor interface {
 	ManualRun(ctx context.Context, id platform.ID, runID platform.ID) (executor.Promise, error)
+	ScheduleManualRun(ctx context.Context, id platform.ID, runID platform.ID) error
 	Cancel(ctx context.Context, runID platform.ID) error
 }
 
@@ -150,7 +150,7 @@ func (c *Coordinator) TaskUpdated(ctx context.Context, from, to *taskmodel.Task)
 	return nil
 }
 
-//TaskDeleted asks the Scheduler to release the deleted task
+// TaskDeleted asks the Scheduler to release the deleted task
 func (c *Coordinator) TaskDeleted(ctx context.Context, id platform.ID) error {
 	tid := scheduler.ID(id)
 	if err := c.sch.Release(tid); err != nil && err != taskmodel.ErrTaskNotClaimed {
@@ -167,14 +167,19 @@ func (c *Coordinator) RunCancelled(ctx context.Context, runID platform.ID) error
 	return err
 }
 
-// RunForced speaks directly to the Executor to run a task immediately
+// RunForced speaks directly to the Executor to run a task immediately, or schedule the run if `scheduledFor` is set.
 func (c *Coordinator) RunForced(ctx context.Context, task *taskmodel.Task, run *taskmodel.Run) error {
-	// the returned promise is not used, since clients expect the HTTP server to return immediately after scheduling the
-	// task rather than waiting for the task to finish
-	_, err := c.ex.ManualRun(ctx, task.ID, run.ID)
+	var err error
+	if !run.ScheduledFor.IsZero() {
+		err = c.ex.ScheduleManualRun(ctx, task.ID, run.ID)
+	} else {
+		// the returned promise is not used, since clients expect the HTTP server to return immediately after scheduling the
+		// task rather than waiting for the task to finish
+		_, err = c.ex.ManualRun(ctx, task.ID, run.ID)
+	}
+
 	if err != nil {
 		return taskmodel.ErrRunExecutionError(err)
 	}
-
 	return nil
 }

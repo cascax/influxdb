@@ -34,7 +34,7 @@ type Source struct {
 	id execute.DatasetID
 	ts []execute.Transformation
 
-	alloc *memory.Allocator
+	alloc memory.Allocator
 	stats cursors.CursorStats
 
 	runner runner
@@ -47,14 +47,7 @@ type Source struct {
 func (s *Source) Run(ctx context.Context) {
 	labelValues := s.m.getLabelValues(ctx, s.orgID, s.op)
 	start := time.Now()
-	var err error
-	if flux.IsQueryTracingEnabled(ctx) {
-		span, ctxWithSpan := tracing.StartSpanFromContextWithOperationName(ctx, "source-"+s.op)
-		err = s.runner.run(ctxWithSpan)
-		span.Finish()
-	} else {
-		err = s.runner.run(ctx)
-	}
+	err := s.runner.run(ctx)
 	s.m.recordMetrics(labelValues, start)
 	for _, t := range s.ts {
 		t.Finish(s.id, err)

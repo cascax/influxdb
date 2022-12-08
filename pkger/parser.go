@@ -6,18 +6,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/influxdata/flux/ast"
 	"github.com/influxdata/flux/ast/edit"
+	fluxurl "github.com/influxdata/flux/dependencies/url"
 	"github.com/influxdata/flux/parser"
 	errors2 "github.com/influxdata/influxdb/v2/kit/platform/errors"
 	"github.com/influxdata/influxdb/v2/pkg/jsonnet"
@@ -115,7 +118,7 @@ func FromFile(filePath string) ReaderFn {
 		}
 
 		// not using os.Open to avoid having to deal with closing the file in here
-		b, err := ioutil.ReadFile(u.Path)
+		b, err := os.ReadFile(u.Path)
 		if err != nil {
 			return nil, filePath, err
 		}
@@ -145,15 +148,39 @@ func FromString(s string) ReaderFn {
 	}
 }
 
-var defaultHTTPClient = &http.Client{
-	Timeout: time.Minute,
+// NewDefaultHTTPClient creates a client with the specified flux IP validator.
+// This is copied from flux/dependencies/http/http.go
+func NewDefaultHTTPClient(urlValidator fluxurl.Validator) *http.Client {
+	// Control is called after DNS lookup, but before the network
+	// connection is initiated.
+	control := func(network, address string, c syscall.RawConn) error {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return err
+		}
+
+		ip := net.ParseIP(host)
+		return urlValidator.ValidateIP(ip)
+	}
+
+	dialer := &net.Dialer{
+		Timeout: time.Minute,
+		Control: control,
+		// DualStack is deprecated
+	}
+
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: dialer.DialContext,
+		},
+	}
 }
 
 // FromHTTPRequest parses a pkg from the request body of a HTTP request. This is
 // very useful when using packages that are hosted..
-func FromHTTPRequest(addr string) ReaderFn {
+func FromHTTPRequest(addr string, client *http.Client) ReaderFn {
 	return func() (io.Reader, string, error) {
-		resp, err := defaultHTTPClient.Get(normalizeGithubURLToContent(addr))
+		resp, err := client.Get(normalizeGithubURLToContent(addr))
 		if err != nil {
 			return nil, addr, err
 		}
@@ -209,7 +236,16 @@ func parseJSON(r io.Reader, opts ...ValidateOptFn) (*Template, error) {
 }
 
 func parseJsonnet(r io.Reader, opts ...ValidateOptFn) (*Template, error) {
-	return parse(jsonnet.NewDecoder(r), opts...)
+	opt := &validateOpt{}
+	for _, o := range opts {
+		o(opt)
+	}
+	// For security, we'll default to disabling parsing jsonnet but allow callers to override the behavior via
+	// EnableJsonnet(). Enabling jsonnet might be useful for client code where parsing jsonnet could be acceptable.
+	if opt.enableJsonnet {
+		return parse(jsonnet.NewDecoder(r), opts...)
+	}
+	return nil, fmt.Errorf("%s: jsonnet", ErrInvalidEncoding)
 }
 
 func parseSource(r io.Reader, opts ...ValidateOptFn) (*Template, error) {
@@ -217,7 +253,7 @@ func parseSource(r io.Reader, opts ...ValidateOptFn) (*Template, error) {
 	if byter, ok := r.(interface{ Bytes() []byte }); ok {
 		b = byter.Bytes()
 	} else {
-		bb, err := ioutil.ReadAll(r)
+		bb, err := io.ReadAll(r)
 		if err != nil {
 			return nil, fmt.Errorf("failed to decode pkg source: %s", err)
 		}
@@ -536,13 +572,21 @@ func Combine(pkgs []*Template, validationOpts ...ValidateOptFn) (*Template, erro
 
 type (
 	validateOpt struct {
-		minResources bool
-		skipValidate bool
+		minResources  bool
+		skipValidate  bool
+		enableJsonnet bool
 	}
 
 	// ValidateOptFn provides a means to disable desired validation checks.
 	ValidateOptFn func(*validateOpt)
 )
+
+// Jsonnet parsing is disabled by default. EnableJsonnet turns it back on.
+func EnableJsonnet() ValidateOptFn {
+	return func(opt *validateOpt) {
+		opt.enableJsonnet = true
+	}
+}
 
 // ValidWithoutResources ignores the validation check for minimum number
 // of resources. This is useful for the service Create to ignore this and

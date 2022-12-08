@@ -8,6 +8,7 @@ import (
 	reflect "reflect"
 
 	gomock "github.com/golang/mock/gomock"
+	influxdb "github.com/influxdata/influxdb/v2"
 	platform "github.com/influxdata/influxdb/v2/kit/platform"
 )
 
@@ -34,6 +35,20 @@ func (m *MockDurableQueueManager) EXPECT() *MockDurableQueueManagerMockRecorder 
 	return m.recorder
 }
 
+// CloseAll mocks base method.
+func (m *MockDurableQueueManager) CloseAll() error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CloseAll")
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// CloseAll indicates an expected call of CloseAll.
+func (mr *MockDurableQueueManagerMockRecorder) CloseAll() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CloseAll", reflect.TypeOf((*MockDurableQueueManager)(nil).CloseAll))
+}
+
 // CurrentQueueSizes mocks base method.
 func (m *MockDurableQueueManager) CurrentQueueSizes(arg0 []platform.ID) (map[platform.ID]int64, error) {
 	m.ctrl.T.Helper()
@@ -47,20 +62,6 @@ func (m *MockDurableQueueManager) CurrentQueueSizes(arg0 []platform.ID) (map[pla
 func (mr *MockDurableQueueManagerMockRecorder) CurrentQueueSizes(arg0 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CurrentQueueSizes", reflect.TypeOf((*MockDurableQueueManager)(nil).CurrentQueueSizes), arg0)
-}
-
-// CloseAll mocks base method.
-func (m *MockDurableQueueManager) CloseAll() error {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "CloseAll")
-	ret0, _ := ret[0].(error)
-	return ret0
-}
-
-// CloseAll indicates an expected call of CloseAll.
-func (mr *MockDurableQueueManagerMockRecorder) CloseAll() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CloseAll", reflect.TypeOf((*MockDurableQueueManager)(nil).CloseAll))
 }
 
 // DeleteQueue mocks base method.
@@ -77,22 +78,50 @@ func (mr *MockDurableQueueManagerMockRecorder) DeleteQueue(arg0 interface{}) *go
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteQueue", reflect.TypeOf((*MockDurableQueueManager)(nil).DeleteQueue), arg0)
 }
 
-// InitializeQueue mocks base method.
-func (m *MockDurableQueueManager) InitializeQueue(arg0 platform.ID, arg1 int64) error {
+// EnqueueData mocks base method.
+func (m *MockDurableQueueManager) EnqueueData(arg0 platform.ID, arg1 []byte, arg2 int) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "InitializeQueue", arg0, arg1)
+	ret := m.ctrl.Call(m, "EnqueueData", arg0, arg1, arg2)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// EnqueueData indicates an expected call of EnqueueData.
+func (mr *MockDurableQueueManagerMockRecorder) EnqueueData(arg0, arg1, arg2 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "EnqueueData", reflect.TypeOf((*MockDurableQueueManager)(nil).EnqueueData), arg0, arg1, arg2)
+}
+
+// GetReplications mocks base method.
+func (m *MockDurableQueueManager) GetReplications(arg0, arg1 platform.ID) []platform.ID {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetReplications", arg0, arg1)
+	ret0, _ := ret[0].([]platform.ID)
+	return ret0
+}
+
+// GetReplications indicates an expected call of GetReplications.
+func (mr *MockDurableQueueManagerMockRecorder) GetReplications(arg0, arg1 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetReplications", reflect.TypeOf((*MockDurableQueueManager)(nil).GetReplications), arg0, arg1)
+}
+
+// InitializeQueue mocks base method.
+func (m *MockDurableQueueManager) InitializeQueue(arg0 platform.ID, arg1 int64, arg2, arg3 platform.ID, arg4 int64) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "InitializeQueue", arg0, arg1, arg2, arg3, arg4)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // InitializeQueue indicates an expected call of InitializeQueue.
-func (mr *MockDurableQueueManagerMockRecorder) InitializeQueue(arg0, arg1 interface{}) *gomock.Call {
+func (mr *MockDurableQueueManagerMockRecorder) InitializeQueue(arg0, arg1, arg2, arg3, arg4 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "InitializeQueue", reflect.TypeOf((*MockDurableQueueManager)(nil).InitializeQueue), arg0, arg1)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "InitializeQueue", reflect.TypeOf((*MockDurableQueueManager)(nil).InitializeQueue), arg0, arg1, arg2, arg3, arg4)
 }
 
 // StartReplicationQueues mocks base method.
-func (m *MockDurableQueueManager) StartReplicationQueues(arg0 map[platform.ID]int64) error {
+func (m *MockDurableQueueManager) StartReplicationQueues(arg0 map[platform.ID]*influxdb.TrackedReplication) error {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "StartReplicationQueues", arg0)
 	ret0, _ := ret[0].(error)

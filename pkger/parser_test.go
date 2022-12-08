@@ -2613,7 +2613,8 @@ from(bucket: params.bucket)
     |> filter(fn: (r) => r.floater == params.floatVal)
     |> filter(fn: (r) => r._value > params.minVal)
     |> aggregateWindow(every: v.windowPeriod, fn: max)
-    |> yield(name: params.name)`
+    |> yield(name: params.name)
+`
 
 				q := props.Queries[0]
 				assert.Equal(t, queryText, q.Text)
@@ -3610,7 +3611,8 @@ from(bucket: params.bucket)
     |> filter(fn: (r) => r.floater == params.floatVal)
     |> filter(fn: (r) => r._value > params.minVal)
     |> aggregateWindow(every: v.windowPeriod, fn: max)
-    |> yield(name: params.name)`
+    |> yield(name: params.name)
+`
 
 				assert.Equal(t, queryText, actual.Query)
 
@@ -3730,7 +3732,8 @@ from(bucket: "rucket_1")
     |> filter(fn: (r) => r._measurement == "cpu")
     |> filter(fn: (r) => r._field == "usage_idle")
     |> aggregateWindow(every: 1m, fn: mean)
-    |> yield(name: "mean")`
+    |> yield(name: "mean")
+`
 
 				assert.Equal(t, queryText, actual[0].Query)
 
@@ -3759,7 +3762,8 @@ from(bucket: "rucket_1")
     |> filter(fn: (r) => r._measurement == params.this)
     |> filter(fn: (r) => r._field == "usage_idle")
     |> aggregateWindow(every: 1m, fn: mean)
-    |> yield(name: "mean")`
+    |> yield(name: "mean")
+`
 
 				assert.Equal(t, queryText, actual[0].Query)
 
@@ -4441,8 +4445,13 @@ spec:
 		})
 	})
 
-	t.Run("jsonnet support", func(t *testing.T) {
+	t.Run("jsonnet support disabled by default", func(t *testing.T) {
 		template := validParsedTemplateFromFile(t, "testdata/bucket_associates_labels.jsonnet", EncodingJsonnet)
+		require.Equal(t, &Template{}, template)
+	})
+
+	t.Run("jsonnet support", func(t *testing.T) {
+		template := validParsedTemplateFromFile(t, "testdata/bucket_associates_labels.jsonnet", EncodingJsonnet, EnableJsonnet())
 
 		sum := template.Summary()
 
@@ -4934,7 +4943,7 @@ func nextField(t *testing.T, field string) (string, int) {
 	return "", -1
 }
 
-func validParsedTemplateFromFile(t *testing.T, path string, encoding Encoding) *Template {
+func validParsedTemplateFromFile(t *testing.T, path string, encoding Encoding, opts ...ValidateOptFn) *Template {
 	t.Helper()
 
 	var readFn ReaderFn
@@ -4946,7 +4955,17 @@ func validParsedTemplateFromFile(t *testing.T, path string, encoding Encoding) *
 		atomic.AddInt64(&missedTemplateCacheCounter, 1)
 	}
 
-	template := newParsedTemplate(t, readFn, encoding)
+	opt := &validateOpt{}
+	for _, o := range opts {
+		o(opt)
+	}
+
+	template := newParsedTemplate(t, readFn, encoding, opts...)
+	if encoding == EncodingJsonnet && !opt.enableJsonnet {
+		require.Equal(t, &Template{}, template)
+		return template
+	}
+
 	u := url.URL{
 		Scheme: "file",
 		Path:   path,
@@ -4958,7 +4977,16 @@ func validParsedTemplateFromFile(t *testing.T, path string, encoding Encoding) *
 func newParsedTemplate(t *testing.T, fn ReaderFn, encoding Encoding, opts ...ValidateOptFn) *Template {
 	t.Helper()
 
+	opt := &validateOpt{}
+	for _, o := range opts {
+		o(opt)
+	}
+
 	template, err := Parse(encoding, fn, opts...)
+	if encoding == EncodingJsonnet && !opt.enableJsonnet {
+		require.Error(t, err)
+		return &Template{}
+	}
 	require.NoError(t, err)
 
 	for _, k := range template.Objects {

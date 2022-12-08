@@ -880,7 +880,7 @@ func scanFields(buf []byte, i int) (int, []byte, error) {
 
 // scanTime scans buf, starting at i for the time section of a point. It
 // returns the ending position and the byte slice of the timestamp within buf
-// and and error if the timestamp is not in the correct numeric format.
+// and error if the timestamp is not in the correct numeric format.
 func scanTime(buf []byte, i int) (int, []byte, error) {
 	start := skipWhitespace(buf, i)
 	i = start
@@ -2119,7 +2119,7 @@ func (a Tags) KeyValues(v [][]byte) [][]byte {
 	if cap(v) < l {
 		v = make([][]byte, 0, l)
 	} else {
-		v = v[:l]
+		v = v[:0]
 	}
 	for i := range a {
 		v = append(v, a[i].Key, a[i].Value)

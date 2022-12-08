@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 
@@ -29,14 +30,16 @@ type HTTPServerTemplates struct {
 	api    *kithttp.API
 	logger *zap.Logger
 	svc    SVC
+	client *http.Client
 }
 
 // NewHTTPServerTemplates constructs a new http server.
-func NewHTTPServerTemplates(log *zap.Logger, svc SVC) *HTTPServerTemplates {
+func NewHTTPServerTemplates(log *zap.Logger, svc SVC, client *http.Client) *HTTPServerTemplates {
 	svr := &HTTPServerTemplates{
 		api:    kithttp.NewAPI(kithttp.WithLog(log)),
 		logger: log,
 		svc:    svc,
+		client: client,
 	}
 
 	exportAllowContentTypes := middleware.AllowContentType("text/yml", "application/x-yaml", "application/json")
@@ -211,13 +214,13 @@ type ReqApply struct {
 }
 
 // Templates returns all templates associated with the request.
-func (r ReqApply) Templates(encoding Encoding) (*Template, error) {
+func (r ReqApply) Templates(encoding Encoding, client *http.Client) (*Template, error) {
 	var rawTemplates []*Template
 	for _, rem := range r.Remotes {
 		if rem.URL == "" {
 			continue
 		}
-		template, err := Parse(rem.Encoding(), FromHTTPRequest(rem.URL), ValidSkipParseError())
+		template, err := Parse(rem.Encoding(), FromHTTPRequest(rem.URL, client), ValidSkipParseError())
 		if err != nil {
 			msg := fmt.Sprintf("template from url[%s] had an issue: %s", rem.URL, err.Error())
 			return nil, influxErr(errors.EUnprocessableEntity, msg)
@@ -315,6 +318,14 @@ type RespApply struct {
 	Errors []ValidationErr `json:"errors,omitempty" yaml:"errors,omitempty"`
 }
 
+// RespApplyErr is the response body for a dry-run parse error in the apply template endpoint.
+type RespApplyErr struct {
+	RespApply
+
+	Code    string `json:"code" yaml:"code"`
+	Message string `json:"message" yaml:"message"`
+}
+
 func (s *HTTPServerTemplates) apply(w http.ResponseWriter, r *http.Request) {
 	var reqBody ReqApply
 	encoding, err := decodeWithEncoding(r, &reqBody)
@@ -332,6 +343,40 @@ func (s *HTTPServerTemplates) apply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject use of server-side jsonnet with /api/v2/templates/apply
+	if encoding == EncodingJsonnet {
+		s.api.Err(w, r, &errors.Error{
+			Code: errors.EUnprocessableEntity,
+			Msg:  fmt.Sprintf("template from source(s) had an issue: %s", ErrInvalidEncoding.Error()),
+		})
+		return
+	}
+
+	var remotes []string
+	for _, rem := range reqBody.Remotes {
+		remotes = append(remotes, rem.URL)
+	}
+	remotes = append(remotes, reqBody.RawTemplate.Sources...)
+
+	for _, rem := range remotes {
+		// While things like '.%6Aonnet' evaluate to the default encoding (yaml), let's unescape and catch those too
+		decoded, err := url.QueryUnescape(rem)
+		if err != nil {
+			s.api.Err(w, r, &errors.Error{
+				Code: errors.EInvalid,
+				Msg:  fmt.Sprintf("template from url[%q] had an issue", rem),
+			})
+			return
+		}
+		if len(decoded) > 0 && strings.HasSuffix(strings.ToLower(decoded), "jsonnet") {
+			s.api.Err(w, r, &errors.Error{
+				Code: errors.EUnprocessableEntity,
+				Msg:  fmt.Sprintf("template from url[%q] had an issue: %s", rem, ErrInvalidEncoding.Error()),
+			})
+			return
+		}
+	}
+
 	var stackID platform.ID
 	if reqBody.StackID != nil {
 		if err := stackID.DecodeFromString(*reqBody.StackID); err != nil {
@@ -343,7 +388,7 @@ func (s *HTTPServerTemplates) apply(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	parsedTemplate, err := reqBody.Templates(encoding)
+	parsedTemplate, err := reqBody.Templates(encoding, s.client)
 	if err != nil {
 		s.api.Err(w, r, &errors.Error{
 			Code: errors.EUnprocessableEntity,
@@ -380,7 +425,11 @@ func (s *HTTPServerTemplates) apply(w http.ResponseWriter, r *http.Request) {
 	if reqBody.DryRun {
 		impact, err := s.svc.DryRun(r.Context(), *orgID, userID, applyOpts...)
 		if IsParseErr(err) {
-			s.api.Respond(w, r, http.StatusUnprocessableEntity, impactToRespApply(impact, err))
+			s.api.Respond(w, r, http.StatusUnprocessableEntity, RespApplyErr{
+				RespApply: impactToRespApply(impact, err),
+				Code:      errors.EUnprocessableEntity,
+				Message:   "unprocessable entity",
+			})
 			return
 		}
 		if err != nil {

@@ -3,17 +3,22 @@ package launcher_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html/template"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	nethttp "net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	context2 "github.com/influxdata/influxdb/v2/context"
+	"github.com/influxdata/influxdb/v2/mock"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/influxdata/flux"
 	"github.com/influxdata/flux/csv"
@@ -75,6 +80,19 @@ mem,server=b value=45.2`))
 	results.First(t).HasTablesWithCols([]int{4, 4, 5})
 }
 
+func mustDoRequest(t *testing.T, req *nethttp.Request, expectStatus int) []byte {
+	resp, err := nethttp.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, resp.Body.Close())
+	}()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, expectStatus, resp.StatusCode, "body is: %v", string(body))
+	return body
+}
+
 // This test initialises a default launcher writes some data,
 // and checks that the queried results contain the expected number of tables
 // and expected number of columns.
@@ -82,36 +100,73 @@ func TestLauncher_WriteV2_Query(t *testing.T) {
 	be := launcher.RunAndSetupNewLauncherOrFail(ctx, t)
 	defer be.ShutdownOrFail(t, ctx)
 
+	now := time.Now().UTC()
+
 	// The default gateway instance inserts some values directly such that ID lookups seem to break,
 	// so go the roundabout way to insert things correctly.
 	req := be.MustNewHTTPRequest(
 		"POST",
 		fmt.Sprintf("/api/v2/write?org=%s&bucket=%s", be.Org.ID, be.Bucket.ID),
-		fmt.Sprintf("ctr n=1i %d", time.Now().UnixNano()),
+		fmt.Sprintf("ctr n=1i %d", now.UnixNano()),
 	)
 	phttp.SetToken(be.Auth.Token, req)
 
-	resp, err := nethttp.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			t.Error(err)
-		}
-	}()
-
-	if resp.StatusCode != nethttp.StatusNoContent {
-		buf := new(bytes.Buffer)
-		if _, err := io.Copy(buf, resp.Body); err != nil {
-			t.Fatalf("Could not read body: %s", err)
-		}
-		t.Fatalf("exp status %d; got %d, body: %s", nethttp.StatusNoContent, resp.StatusCode, buf.String())
-	}
+	mustDoRequest(t, req, nethttp.StatusNoContent)
 
 	res := be.MustExecuteQuery(fmt.Sprintf(`from(bucket:"%s") |> range(start:-5m)`, be.Bucket.Name))
 	defer res.Done()
 	res.HasTableCount(t, 1)
+
+	require.NoError(t, be.DBRPMappingService().Create(context2.SetAuthorizer(ctx, mock.NewMockAuthorizer(true, nil)), &influxdb.DBRPMapping{
+		ID:              0,
+		Database:        "mydb",
+		RetentionPolicy: "autogen",
+		Default:         true,
+		OrganizationID:  be.Org.ID,
+		BucketID:        be.Bucket.ID,
+	}))
+
+	tests := []struct {
+		name         string
+		permissions  string
+		expectStatus int
+		expectBody   string
+	}{
+		{
+			name:         "only auth permission",
+			permissions:  `[{"action": "read", "resource": {"type": "authorizations"}}]`,
+			expectStatus: 200,
+			expectBody:   `{"results":[{"statement_id":0,"error":"database not found: mydb"}]}` + "\n",
+		}, {
+			name:         "only write permission",
+			permissions:  fmt.Sprintf(`[{"action": "write", "resource": {"type": "buckets", "name": %q}}]`, be.Bucket.Name),
+			expectStatus: 200,
+			expectBody:   `{"results":[{"statement_id":0,"error":"database not found: mydb"}]}` + "\n",
+		}, {
+			name:         "only read permission",
+			permissions:  fmt.Sprintf(`[{"action": "read", "resource": {"type": "buckets", "name": %q}}]`, be.Bucket.Name),
+			expectStatus: 200,
+			expectBody:   fmt.Sprintf(`{"results":[{"statement_id":0,"series":[{"name":"ctr","columns":["time","n"],"values":[["%v",1]]}]}]}`, now.Format("2006-01-02T15:04:05.999999999Z")) + "\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokenReq := be.MustNewHTTPRequest(
+				"POST", "/api/v2/authorizations",
+				fmt.Sprintf(`{"status": "active", "orgID": %q, "permissions": %v}`, be.Org.ID.String(), tt.permissions),
+			)
+			token := struct {
+				Token string `json:"token"`
+			}{}
+			require.NoError(t, json.Unmarshal(mustDoRequest(t, tokenReq, nethttp.StatusCreated), &token))
+			queryReq := be.MustNewHTTPRequest("POST", "/query?db=mydb", "select * from /.*/")
+			phttp.SetToken(token.Token, queryReq)
+			queryReq.Header.Set("Content-Type", "application/vnd.influxql")
+			body := mustDoRequest(t, queryReq, tt.expectStatus)
+			assert.Equal(t, tt.expectBody, string(body))
+		})
+	}
+
 }
 
 func getMemoryUnused(t *testing.T, reg *prom.Registry) int64 {
@@ -221,7 +276,7 @@ func queryPoints(ctx context.Context, t *testing.T, l *launcher.TestLauncher, op
 	if d.verbose {
 		t.Logf("query:\n%s", qs)
 	}
-	pkg, err := runtime.ParseToJSON(qs)
+	pkg, err := runtime.ParseToJSON(context.Background(), qs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,10 +291,10 @@ func queryPoints(ctx context.Context, t *testing.T, l *launcher.TestLauncher, op
 }
 
 // This test:
-//  - initializes a default launcher and sets memory limits;
-//  - writes some data;
-//  - queries the data;
-//  - verifies that the query fails (or not) and that the memory was de-allocated.
+//   - initializes a default launcher and sets memory limits;
+//   - writes some data;
+//   - queries the data;
+//   - verifies that the query fails (or not) and that the memory was de-allocated.
 func TestLauncher_QueryMemoryLimits(t *testing.T) {
 	tcs := []struct {
 		name           string
@@ -330,12 +385,12 @@ func TestLauncher_QueryMemoryLimits(t *testing.T) {
 }
 
 // This test:
-//  - initializes a default launcher and sets memory limits;
-//  - writes some data;
-//  - launches a query that does not error;
-//  - launches a query that gets canceled while executing;
-//  - launches a query that does not error;
-//  - verifies after each query run the used memory.
+//   - initializes a default launcher and sets memory limits;
+//   - writes some data;
+//   - launches a query that does not error;
+//   - launches a query that gets canceled while executing;
+//   - launches a query that does not error;
+//   - verifies after each query run the used memory.
 func TestLauncher_QueryMemoryManager_ExceedMemory(t *testing.T) {
 	t.Skip("this test is flaky, occasionally get error: \"memory allocation limit reached\" on OK query")
 
@@ -374,12 +429,12 @@ func TestLauncher_QueryMemoryManager_ExceedMemory(t *testing.T) {
 }
 
 // This test:
-//  - initializes a default launcher and sets memory limits;
-//  - writes some data;
-//  - launches a query that does not error;
-//  - launches a query and cancels its context;
-//  - launches a query that does not error;
-//  - verifies after each query run the used memory.
+//   - initializes a default launcher and sets memory limits;
+//   - writes some data;
+//   - launches a query that does not error;
+//   - launches a query and cancels its context;
+//   - launches a query that does not error;
+//   - verifies after each query run the used memory.
 func TestLauncher_QueryMemoryManager_ContextCanceled(t *testing.T) {
 	t.Skip("this test is flaky, occasionally get error: \"memory allocation limit reached\"")
 
@@ -412,13 +467,14 @@ func TestLauncher_QueryMemoryManager_ContextCanceled(t *testing.T) {
 }
 
 // This test:
-//  - initializes a default launcher and sets memory limits;
-//  - writes some data;
-//  - launches (concurrently) a mixture of
-//    - OK queries;
-//    - queries that exceed the memory limit;
-//    - queries that get canceled;
-//  - verifies the used memory.
+//   - initializes a default launcher and sets memory limits;
+//   - writes some data;
+//   - launches (concurrently) a mixture of
+//   - OK queries;
+//   - queries that exceed the memory limit;
+//   - queries that get canceled;
+//   - verifies the used memory.
+//
 // Concurrency limit is set to 1, so only 1 query runs at a time and the others are queued.
 // OK queries do not overcome the soft limit, so that they can run concurrently with the ones that exceed limits.
 // The aim of this test is to verify that memory tracking works properly in the controller,
@@ -755,11 +811,11 @@ func (s TestQueryProfiler) Name() string {
 	return fmt.Sprintf("query%d", s.start)
 }
 
-func (s TestQueryProfiler) GetSortedResult(q flux.Query, alloc *memory.Allocator, desc bool, sortKeys ...string) (flux.Table, error) {
+func (s TestQueryProfiler) GetSortedResult(q flux.Query, alloc memory.Allocator, desc bool, sortKeys ...string) (flux.Table, error) {
 	return nil, nil
 }
 
-func (s TestQueryProfiler) GetResult(q flux.Query, alloc *memory.Allocator) (flux.Table, error) {
+func (s TestQueryProfiler) GetResult(q flux.Query, alloc memory.Allocator) (flux.Table, error) {
 	groupKey := execute.NewGroupKey(
 		[]flux.ColMeta{
 			{
@@ -930,7 +986,7 @@ error2","query plan",109,110
 				t.Error(err)
 			} else {
 				dec := csv.NewMultiResultDecoder(csv.ResultDecoderConfig{})
-				want, err := dec.Decode(ioutil.NopCloser(strings.NewReader(tc.want)))
+				want, err := dec.Decode(io.NopCloser(strings.NewReader(tc.want)))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -2535,7 +2591,7 @@ from(bucket: v.bucket)
 			defer got.Release()
 
 			dec := csv.NewMultiResultDecoder(csv.ResultDecoderConfig{})
-			want, err := dec.Decode(ioutil.NopCloser(strings.NewReader(tc.want)))
+			want, err := dec.Decode(io.NopCloser(strings.NewReader(tc.want)))
 			if err != nil {
 				t.Fatal(err)
 			}

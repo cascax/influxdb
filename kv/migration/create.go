@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"go/format"
 	"html/template"
-	"io/ioutil"
+	"os"
 	"strings"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 const newMigrationFmt = `package all
@@ -17,7 +20,7 @@ var %s = &Migration{}
 // CreateNewMigration persists a new migration file in the appropriate location
 // and updates the appropriate all.go list of migrations
 func CreateNewMigration(existing []Spec, name string) error {
-	camelName := strings.Replace(strings.Title(name), " ", "", -1)
+	camelName := strings.Replace(cases.Title(language.Und).String(name), " ", "", -1)
 
 	newMigrationNumber := len(existing) + 1
 
@@ -27,13 +30,13 @@ func CreateNewMigration(existing []Spec, name string) error {
 
 	fmt.Println("Creating new migration:", newMigrationFile)
 
-	if err := ioutil.WriteFile(newMigrationFile, []byte(fmt.Sprintf(newMigrationFmt, newMigrationVariable)), 0644); err != nil {
+	if err := os.WriteFile(newMigrationFile, []byte(fmt.Sprintf(newMigrationFmt, newMigrationVariable)), 0644); err != nil {
 		return err
 	}
 
 	fmt.Println("Inserting migration into ./kv/migration/all/all.go")
 
-	tmplData, err := ioutil.ReadFile("./kv/migration/all/all.go")
+	tmplData, err := os.ReadFile("./kv/migration/all/all.go")
 	if err != nil {
 		return err
 	}
@@ -66,7 +69,7 @@ func CreateNewMigration(existing []Spec, name string) error {
 		return err
 	}
 
-	if err := ioutil.WriteFile("./kv/migration/all/all.go", src, 0644); err != nil {
+	if err := os.WriteFile("./kv/migration/all/all.go", src, 0644); err != nil {
 		return err
 	}
 

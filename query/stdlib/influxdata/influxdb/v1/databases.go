@@ -43,7 +43,7 @@ type DatabasesDecoder struct {
 	orgID     platform2.ID
 	deps      *DatabasesDependencies
 	databases []*platform.DBRPMapping
-	alloc     *memory.Allocator
+	alloc     memory.Allocator
 }
 
 func (bd *DatabasesDecoder) Connect(ctx context.Context) error {
@@ -200,7 +200,7 @@ func (rule LocalDatabasesRule) Name() string {
 }
 
 func (rule LocalDatabasesRule) Pattern() plan.Pattern {
-	return plan.Pat(v1.DatabasesKind)
+	return plan.MultiSuccessor(v1.DatabasesKind)
 }
 
 func (rule LocalDatabasesRule) Rewrite(ctx context.Context, node plan.Node) (plan.Node, bool, error) {

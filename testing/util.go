@@ -2,7 +2,6 @@ package testing
 
 import (
 	"context"
-	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
@@ -14,13 +13,14 @@ import (
 	"github.com/influxdata/influxdb/v2/kit/platform/errors"
 	"github.com/influxdata/influxdb/v2/kv"
 	"github.com/influxdata/influxdb/v2/kv/migration/all"
+	"github.com/influxdata/influxdb/v2/query/fluxlang"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 )
 
 func NewTestBoltStore(t *testing.T) (kv.SchemaStore, func()) {
-	f, err := ioutil.TempFile("", "influxdata-bolt-")
+	f, err := os.CreateTemp("", "influxdata-bolt-")
 	require.NoError(t, err, "unable to create temporary boltdb file")
 	require.NoError(t, f.Close())
 
@@ -120,6 +120,14 @@ func MustCreateUsers(ctx context.Context, svc influxdb.UserService, us ...*influ
 	}
 }
 
+func MustNewPermission(a influxdb.Action, rt influxdb.ResourceType, orgID platform.ID) *influxdb.Permission {
+	perm, err := influxdb.NewPermission(a, rt, orgID)
+	if err != nil {
+		panic(err)
+	}
+	return perm
+}
+
 func MustNewPermissionAtID(id platform.ID, a influxdb.Action, rt influxdb.ResourceType, orgID platform.ID) *influxdb.Permission {
 	perm, err := influxdb.NewPermissionAtID(id, a, rt, orgID)
 	if err != nil {
@@ -147,4 +155,14 @@ func influxErrsEqual(t *testing.T, expected *errors.Error, actual error) {
 	require.True(t, ok)
 	assert.Equal(t, expected.Code, iErr.Code)
 	assert.Truef(t, strings.HasPrefix(iErr.Error(), expected.Error()), "expected: %s got err: %s", expected.Error(), actual.Error())
+}
+
+func FormatFluxString(t *testing.T, script string) string {
+	svc := fluxlang.DefaultService
+
+	astPkg, err := svc.Parse(script)
+	require.NoError(t, err)
+	formatted, err := svc.Format(astPkg.Files[0])
+	require.NoError(t, err)
+	return formatted
 }

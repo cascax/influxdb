@@ -31,9 +31,47 @@ build_test_harness() {
   "$GO" build -o fluxtest ./internal/cmd/fluxtest-harness-influxdb
 }
 
+skipped_tests() {
+  doc=$(cat <<ENDSKIPS
+align_time
+buckets
+covariance
+cumulative_sum_default
+cumulative_sum_noop
+cumulative_sum
+difference_columns
+fill
+fill_bool
+fill_float
+fill_time
+fill_int
+fill_uint
+fill_string
+histogram_normalize
+histogram_quantile_minvalue
+histogram_quantile
+histogram
+key_values_host_name
+secrets
+set
+shapeDataWithFilter
+shapeData
+shift_negative_duration
+unique
+window_null
+
+ENDSKIPS
+)
+  echo "$doc" | sed '/^[[:space:]]*$/d' | sed 's/[[:space:]]*#.*$//' | tr '\n' ',' | sed 's/,$//'
+}
+
 run_integration_tests() {
   log "Running integration tests..."
-  ./fluxtest -v -p flux.zip -p query/
+  ./fluxtest \
+      -v \
+      -p flux.zip \
+      -p query/ \
+      --skip "$(skipped_tests)"
 }
 
 cleanup() {

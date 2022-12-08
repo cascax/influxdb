@@ -4,7 +4,10 @@ templates for what will eventually come to support all influxdb
 resources.
 
 The parser supports JSON, Jsonnet, and YAML encodings as well as a number
-of different ways to read the file/reader/string as it may.
+of different ways to read the file/reader/string as it may. While the parser
+supports Jsonnet, due to issues in the go-jsonnet implementation, only trusted
+input should be given to the parser and therefore the EnableJsonnet() option
+must be used with Parse() to enable Jsonnet support.
 
 As an example, you can use the following to parse and validate a YAML
 file and see a summary of its contents:
@@ -20,7 +23,7 @@ The parser will validate all contents of the template and provide any
 and all fields/entries that failed validation.
 
 If you wish to use the Template type in your transport layer and let the
-the transport layer manage the decoding, then you can run the following
+transport layer manage the decoding, then you can run the following
 to validate the template after the raw decoding is done:
 
 	if err := template.Validate(); err != nil {

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -142,7 +141,7 @@ func Test_handlePostDBRP(t *testing.T) {
 			defer resp.Body.Close()
 
 			if tt.ExpectedErr != nil {
-				b, err := ioutil.ReadAll(resp.Body)
+				b, err := io.ReadAll(resp.Body)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -284,7 +283,7 @@ func Test_handleGetDBRPs(t *testing.T) {
 			defer resp.Body.Close()
 
 			if tt.ExpectedErr != nil {
-				b, err := ioutil.ReadAll(resp.Body)
+				b, err := io.ReadAll(resp.Body)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -412,7 +411,7 @@ func Test_handlePatchDBRP(t *testing.T) {
 			defer resp.Body.Close()
 
 			if tt.ExpectedErr != nil {
-				b, err := ioutil.ReadAll(resp.Body)
+				b, err := io.ReadAll(resp.Body)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -490,7 +489,7 @@ func Test_handleDeleteDBRP(t *testing.T) {
 				BucketID:        influxdbtesting.MustIDBase16("5555f7ed2a035555"),
 				OrganizationID:  influxdbtesting.MustIDBase16("059af7ed2a034000"),
 				Database:        "mydb",
-				RetentionPolicy: "autogen",
+				RetentionPolicy: "testrp",
 				Default:         true,
 			}
 			if err := svc.Create(ctx, d); err != nil {
@@ -505,7 +504,7 @@ func Test_handleDeleteDBRP(t *testing.T) {
 			defer resp.Body.Close()
 
 			if tt.ExpectedErr != nil {
-				b, err := ioutil.ReadAll(resp.Body)
+				b, err := io.ReadAll(resp.Body)
 				if err != nil {
 					t.Fatal(err)
 				}

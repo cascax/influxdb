@@ -7,10 +7,10 @@ import (
 	"github.com/go-chi/chi"
 	"github.com/go-chi/chi/middleware"
 	"github.com/influxdata/influxdb/v2"
-	"github.com/influxdata/influxdb/v2/kit/feature"
 	"github.com/influxdata/influxdb/v2/kit/platform"
 	"github.com/influxdata/influxdb/v2/kit/platform/errors"
 	kithttp "github.com/influxdata/influxdb/v2/kit/transport/http"
+	"github.com/influxdata/influxdb/v2/kv"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 )
@@ -79,7 +79,9 @@ type ReplicationHandler struct {
 	replicationsService ReplicationService
 }
 
-func NewInstrumentedReplicationHandler(log *zap.Logger, reg prometheus.Registerer, svc ReplicationService) *ReplicationHandler {
+func NewInstrumentedReplicationHandler(log *zap.Logger, reg prometheus.Registerer, kv kv.Store, svc ReplicationService) *ReplicationHandler {
+	// Collect telemetry
+	svc = newTelemetryCollectingService(kv, svc)
 	// Collect metrics.
 	svc = newMetricCollectingService(reg, svc)
 	// Wrap logging.
@@ -102,7 +104,6 @@ func newReplicationHandler(log *zap.Logger, svc ReplicationService) *Replication
 		middleware.Recoverer,
 		middleware.RequestID,
 		middleware.RealIP,
-		h.mwReplicationsFlag,
 	)
 
 	r.Route("/", func(r chi.Router) {
@@ -123,19 +124,6 @@ func newReplicationHandler(log *zap.Logger, svc ReplicationService) *Replication
 
 func (h *ReplicationHandler) Prefix() string {
 	return prefixReplications
-}
-
-func (h *ReplicationHandler) mwReplicationsFlag(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		flags := feature.FlagsFromContext(r.Context())
-
-		if flagVal, ok := flags[feature.ReplicationStreamBackend().Key()]; !ok || !flagVal.(bool) {
-			h.api.Respond(w, r, http.StatusNotFound, nil)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
 }
 
 func (h *ReplicationHandler) handleGetReplications(w http.ResponseWriter, r *http.Request) {

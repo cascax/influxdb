@@ -3,7 +3,6 @@ package limiter_test
 import (
 	"bytes"
 	"io"
-	"io/ioutil"
 	"testing"
 	"time"
 
@@ -14,7 +13,7 @@ func TestWriter_Limited(t *testing.T) {
 	r := bytes.NewReader(bytes.Repeat([]byte{0}, 1024*1024))
 
 	limit := 512 * 1024
-	w := limiter.NewWriter(nopWriteCloser{ioutil.Discard}, limit, 10*1024*1024)
+	w := limiter.NewWriter(nopWriteCloser{io.Discard}, limit, 10*1024*1024)
 
 	start := time.Now()
 	n, err := io.Copy(w, r)
@@ -24,8 +23,11 @@ func TestWriter_Limited(t *testing.T) {
 	}
 
 	rate := float64(n) / elapsed.Seconds()
-	if rate > float64(limit) {
-		t.Errorf("rate limit mismath: exp %f, got %f", float64(limit), rate)
+	// 1% tolerance - we have seen the limit be slightly off on Windows systems, likely due to
+	// rounding of time intervals.
+	tolerance := 1.01
+	if rate > (float64(limit) * tolerance) {
+		t.Errorf("rate limit mismatch: exp %f, got %f", float64(limit), rate)
 	}
 }
 
@@ -43,7 +45,7 @@ func TestWriter_Limiter_ExceedBurst(t *testing.T) {
 		t.Fatal(err)
 	}
 	if n != len(twentyOneBytes) {
-		t.Errorf("exected %d bytes written, but got %d", len(twentyOneBytes), n)
+		t.Errorf("expected %d bytes written, but got %d", len(twentyOneBytes), n)
 	}
 }
 

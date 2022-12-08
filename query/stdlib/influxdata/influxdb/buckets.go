@@ -39,7 +39,7 @@ type BucketsDecoder struct {
 	orgID   platform2.ID
 	deps    BucketDependencies
 	buckets []*platform.Bucket
-	alloc   *memory.Allocator
+	alloc   memory.Allocator
 }
 
 func (bd *BucketsDecoder) Connect(ctx context.Context) error {
@@ -152,7 +152,7 @@ func (rule LocalBucketsRule) Name() string {
 }
 
 func (rule LocalBucketsRule) Pattern() plan.Pattern {
-	return plan.Pat(influxdb.BucketsKind)
+	return plan.MultiSuccessor(influxdb.BucketsKind)
 }
 
 func (rule LocalBucketsRule) Rewrite(ctx context.Context, node plan.Node) (plan.Node, bool, error) {

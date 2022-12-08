@@ -5,10 +5,11 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sync"
+
+	errors2 "github.com/influxdata/influxdb/v2/pkg/errors"
 
 	"github.com/influxdata/influxdb/v2/kit/tracing"
 	"github.com/influxdata/influxdb/v2/pkg/fs"
@@ -121,12 +122,12 @@ func (s *SqlStore) Flush(ctx context.Context) {
 // is the resulting backup. The underlying sqlite connection is needed for both
 // SOURCE and DESTINATION databases to use the sqlite backup API made available by the
 // go-sqlite3 driver.
-func (s *SqlStore) BackupSqlStore(ctx context.Context, w io.Writer) error {
+func (s *SqlStore) BackupSqlStore(ctx context.Context, w io.Writer) (rErr error) {
 	span, _ := tracing.StartSpanFromContext(ctx)
 	defer span.Finish()
 
 	// create a destination db in a temporary directory to hold the backup.
-	tempDir, err := ioutil.TempDir("", "")
+	tempDir, err := os.MkdirTemp("", "")
 	if err != nil {
 		return err
 	}
@@ -137,6 +138,7 @@ func (s *SqlStore) BackupSqlStore(ctx context.Context, w io.Writer) error {
 	if err != nil {
 		return err
 	}
+	defer errors2.Capture(&rErr, dest.Close)
 
 	if err := backup(ctx, dest, s); err != nil {
 		return err
@@ -212,8 +214,8 @@ func sqliteFromSqlConn(c *sql.Conn) (*sqlite3.SQLiteConn, error) {
 }
 
 // RestoreSqlStore replaces the underlying database with the data from r.
-func (s *SqlStore) RestoreSqlStore(ctx context.Context, r io.Reader) error {
-	tempDir, err := ioutil.TempDir("", "")
+func (s *SqlStore) RestoreSqlStore(ctx context.Context, r io.Reader) (rErr error) {
+	tempDir, err := os.MkdirTemp("", "")
 	if err != nil {
 		return err
 	}
@@ -225,13 +227,16 @@ func (s *SqlStore) RestoreSqlStore(ctx context.Context, r io.Reader) error {
 	if err != nil {
 		return err
 	}
+	defer errors2.Capture(&rErr, f.Close)
 
 	// Copy the contents of r to the temporary file
 	if _, err := io.Copy(f, r); err != nil {
 		return err
-	} else if err := f.Sync(); err != nil {
+	}
+	if err := f.Sync(); err != nil {
 		return err
-	} else if err := f.Close(); err != nil {
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 

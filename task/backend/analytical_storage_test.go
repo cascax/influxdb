@@ -2,13 +2,13 @@ package backend_test
 
 import (
 	"context"
-	"io/ioutil"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/golang/mock/gomock"
 	"github.com/influxdata/flux"
+	"github.com/influxdata/flux/dependencies/url"
 	"github.com/influxdata/influxdb/v2"
 	"github.com/influxdata/influxdb/v2/authorization"
 	icontext "github.com/influxdata/influxdb/v2/context"
@@ -36,6 +36,7 @@ import (
 )
 
 func TestAnalyticalStore(t *testing.T) {
+	t.Skip("https://github.com/influxdata/influxdb/issues/22920")
 	servicetest.TestTaskService(
 		t,
 		func(t *testing.T) (*servicetest.System, context.CancelFunc) {
@@ -178,7 +179,7 @@ func newAnalyticalBackend(t *testing.T, orgSvc influxdb.OrganizationService, buc
 	// Mostly copied out of cmd/influxd/main.go.
 	logger := zaptest.NewLogger(t)
 
-	rootDir, err := ioutil.TempDir("", "task-logreaderwriter-")
+	rootDir, err := os.MkdirTemp("", "task-logreaderwriter-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +208,7 @@ func newAnalyticalBackend(t *testing.T, orgSvc influxdb.OrganizationService, buc
 	storageStore := storage2.NewStore(engine.TSDBStore(), engine.MetaClient())
 	readsReader := storageflux.NewReader(storageStore)
 
-	deps, err := stdlib.NewDependencies(readsReader, engine, bucketSvc, orgSvc, nil, nil)
+	deps, err := stdlib.NewDependencies(readsReader, engine, bucketSvc, orgSvc, nil, nil, stdlib.WithURLValidator(url.PassValidator{}))
 	if err != nil {
 		t.Fatal(err)
 	}

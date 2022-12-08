@@ -15,6 +15,8 @@ import (
 
 	"github.com/influxdata/flux"
 	"github.com/influxdata/flux/dependencies/testing"
+	"github.com/influxdata/flux/dependencies/url"
+	"github.com/influxdata/flux/execute/executetest"
 	platform "github.com/influxdata/influxdb/v2"
 	"github.com/influxdata/influxdb/v2/annotations"
 	annotationTransport "github.com/influxdata/influxdb/v2/annotations/transport"
@@ -43,7 +45,6 @@ import (
 	"github.com/influxdata/influxdb/v2/kv/migration"
 	"github.com/influxdata/influxdb/v2/kv/migration/all"
 	"github.com/influxdata/influxdb/v2/label"
-	"github.com/influxdata/influxdb/v2/nats"
 	"github.com/influxdata/influxdb/v2/notebooks"
 	notebookTransport "github.com/influxdata/influxdb/v2/notebooks/transport"
 	endpointservice "github.com/influxdata/influxdb/v2/notification/endpoint/service"
@@ -76,6 +77,7 @@ import (
 	telegrafservice "github.com/influxdata/influxdb/v2/telegraf/service"
 	"github.com/influxdata/influxdb/v2/telemetry"
 	"github.com/influxdata/influxdb/v2/tenant"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 
 	// needed for tsm1
 	_ "github.com/influxdata/influxdb/v2/tsdb/engine/tsm1"
@@ -89,7 +91,6 @@ import (
 	"github.com/influxdata/influxdb/v2/vault"
 	pzap "github.com/influxdata/influxdb/v2/zap"
 	"github.com/opentracing/opentracing-go"
-	"github.com/prometheus/client_golang/prometheus"
 	jaegerconfig "github.com/uber/jaeger-client-go/config"
 	"go.uber.org/zap"
 )
@@ -213,11 +214,42 @@ func (m *Launcher) run(ctx context.Context, opts *InfluxdOpts) (err error) {
 		zap.String("version", info.Version),
 		zap.String("commit", info.Commit),
 		zap.String("build_date", info.Date),
+		zap.String("log_level", opts.LogLevel.String()),
 	)
 	m.initTracing(opts)
 
+	if p := opts.Viper.ConfigFileUsed(); p != "" {
+		m.log.Debug("loaded config file", zap.String("path", p))
+	}
+
+	if opts.NatsPort != 0 {
+		m.log.Warn("nats-port argument is deprecated and unused")
+	}
+
+	if opts.NatsMaxPayloadBytes != 0 {
+		m.log.Warn("nats-max-payload-bytes argument is deprecated and unused")
+	}
+
+	// Parse feature flags.
+	// These flags can be used to modify the remaining setup logic in this method.
+	// They will also be injected into the contexts of incoming HTTP requests at runtime,
+	// for use in modifying behavior there.
+	if m.flagger == nil {
+		m.flagger = feature.DefaultFlagger()
+		if len(opts.FeatureFlags) > 0 {
+			f, err := overrideflagger.Make(opts.FeatureFlags, feature.ByKey)
+			if err != nil {
+				m.log.Error("Failed to configure feature flag overrides",
+					zap.Error(err), zap.Any("overrides", opts.FeatureFlags))
+				return err
+			}
+			m.log.Info("Running with feature flag overrides", zap.Any("overrides", opts.FeatureFlags))
+			m.flagger = f
+		}
+	}
+
 	m.reg = prom.NewRegistry(m.log.With(zap.String("service", "prom_registry")))
-	m.reg.MustRegister(prometheus.NewGoCollector())
+	m.reg.MustRegister(collectors.NewGoCollector())
 
 	// Open KV and SQL stores.
 	procID, err := m.openMetaStores(ctx, opts)
@@ -259,7 +291,7 @@ func (m *Launcher) run(ctx context.Context, opts *InfluxdOpts) (err error) {
 
 	secretStore, err := secret.NewStore(m.kvStore)
 	if err != nil {
-		m.log.Error("Failed creating new meta store", zap.Error(err))
+		m.log.Error("Failed creating new secret store", zap.Error(err))
 		return err
 	}
 
@@ -306,6 +338,7 @@ func (m *Launcher) run(ctx context.Context, opts *InfluxdOpts) (err error) {
 		m.engine = storage.NewEngine(
 			opts.EnginePath,
 			opts.StorageConfig,
+			storage.WithMetricsDisabled(opts.MetricsDisabled),
 			storage.WithMetaClient(metaClient),
 		)
 	}
@@ -330,13 +363,49 @@ func (m *Launcher) run(ctx context.Context, opts *InfluxdOpts) (err error) {
 		restoreService platform.RestoreService = m.engine
 	)
 
+	remotesSvc := remotes.NewService(m.sqlStore)
+	remotesServer := remotesTransport.NewInstrumentedRemotesHandler(
+		m.log.With(zap.String("handler", "remotes")), m.reg, m.kvStore, remotesSvc)
+
+	replicationSvc, replicationsMetrics := replications.NewService(m.sqlStore, ts, pointsWriter, m.log.With(zap.String("service", "replications")), opts.EnginePath, opts.InstanceID)
+	replicationServer := replicationTransport.NewInstrumentedReplicationHandler(
+		m.log.With(zap.String("handler", "replications")), m.reg, m.kvStore, replicationSvc)
+	ts.BucketService = replications.NewBucketService(
+		m.log.With(zap.String("service", "replication_buckets")), ts.BucketService, replicationSvc)
+
+	m.reg.MustRegister(replicationsMetrics.PrometheusCollectors()...)
+
+	if err = replicationSvc.Open(ctx); err != nil {
+		m.log.Error("Failed to open replications service", zap.Error(err))
+		return err
+	}
+
+	m.closers = append(m.closers, labeledCloser{
+		label: "replications",
+		closer: func(context.Context) error {
+			return replicationSvc.Close()
+		},
+	})
+
+	pointsWriter = replicationSvc
+
+	// When --hardening-enabled, use an HTTP IP validator that restricts
+	// flux and pkger HTTP requests to private addressess.
+	var urlValidator url.Validator
+	if opts.HardeningEnabled {
+		urlValidator = url.PrivateIPValidator{}
+	} else {
+		urlValidator = url.PassValidator{}
+	}
+
 	deps, err := influxdb.NewDependencies(
 		storageflux.NewReader(storage2.NewStore(m.engine.TSDBStore(), m.engine.MetaClient())),
-		m.engine,
+		pointsWriter,
 		authorizer.NewBucketService(ts.BucketService),
 		authorizer.NewOrgService(ts.OrganizationService),
 		authorizer.NewSecretService(secretSvc),
 		nil,
+		influxdb.WithURLValidator(urlValidator),
 	)
 	if err != nil {
 		m.log.Error("Failed to get query controller dependencies", zap.Error(err))
@@ -345,6 +414,7 @@ func (m *Launcher) run(ctx context.Context, opts *InfluxdOpts) (err error) {
 
 	dependencyList := []flux.Dependency{deps}
 	if opts.Testing {
+		dependencyList = append(dependencyList, executetest.NewDefaultTestFlagger())
 		dependencyList = append(dependencyList, testing.FrameworkConfig{})
 	}
 
@@ -355,6 +425,7 @@ func (m *Launcher) run(ctx context.Context, opts *InfluxdOpts) (err error) {
 		MaxMemoryBytes:                  opts.MaxMemoryBytes,
 		QueueSize:                       opts.QueueSize,
 		ExecutorDependencies:            dependencyList,
+		FluxLogEnabled:                  opts.FluxLogEnabled,
 	}, m.log.With(zap.String("service", "storage-reads")))
 	if err != nil {
 		m.log.Error("Failed to create query controller", zap.Error(err))
@@ -390,6 +461,10 @@ func (m *Launcher) run(ctx context.Context, opts *InfluxdOpts) (err error) {
 			combinedTaskService,
 			executor.WithFlagger(m.flagger),
 		)
+		err = executor.LoadExistingScheduleRuns(ctx)
+		if err != nil {
+			m.log.Fatal("could not load existing scheduled runs", zap.Error(err))
+		}
 		m.executor = executor
 		m.reg.MustRegister(executorMetrics.PrometheusCollectors()...)
 		schLogger := m.log.With(zap.String("service", "task-scheduler"))
@@ -506,67 +581,18 @@ func (m *Launcher) run(ctx context.Context, opts *InfluxdOpts) (err error) {
 		telegrafSvc = telegrafservice.New(m.kvStore)
 	}
 
-	// NATS streaming server
-	natsOpts := nats.NewDefaultServerOptions()
-	natsOpts.Port = opts.NatsPort
-	natsOpts.MaxPayload = opts.NatsMaxPayloadBytes
-	natsServer := nats.NewServer(&natsOpts, m.log.With(zap.String("service", "nats")))
-	if err := natsServer.Open(); err != nil {
-		m.log.Error("Failed to start nats streaming server", zap.Error(err))
-		return err
-	}
-	m.closers = append(m.closers, labeledCloser{
-		label: "nats",
-		closer: func(context.Context) error {
-			natsServer.Close()
-			return nil
-		},
-	})
-	// If a random port was used, the opts will be updated to include the selected value.
-	natsURL := fmt.Sprintf("http://127.0.0.1:%d", natsOpts.Port)
-	publisher := nats.NewAsyncPublisher(m.log, fmt.Sprintf("nats-publisher-%d", natsOpts.Port), natsURL)
-	if err := publisher.Open(); err != nil {
-		m.log.Error("Failed to connect to streaming server", zap.Error(err))
-		return err
-	}
-
-	// TODO(jm): this is an example of using a subscriber to consume from the channel. It should be removed.
-	subscriber := nats.NewQueueSubscriber(fmt.Sprintf("nats-subscriber-%d", natsOpts.Port), natsURL)
-	if err := subscriber.Open(); err != nil {
-		m.log.Error("Failed to connect to streaming server", zap.Error(err))
-		return err
-	}
-
-	subscriber.Subscribe(gather.MetricsSubject, "metrics", gather.NewRecorderHandler(m.log, gather.PointWriter{Writer: pointsWriter}))
-	scraperScheduler, err := gather.NewScheduler(m.log, 10, scraperTargetSvc, publisher, subscriber, 10*time.Second, 30*time.Second)
+	scraperScheduler, err := gather.NewScheduler(m.log.With(zap.String("service", "scraper")), 100, 10, scraperTargetSvc, pointsWriter, 10*time.Second)
 	if err != nil {
 		m.log.Error("Failed to create scraper subscriber", zap.Error(err))
 		return err
 	}
-
-	m.wg.Add(1)
-	go func(log *zap.Logger) {
-		defer m.wg.Done()
-		log = log.With(zap.String("service", "scraper"))
-		if err := scraperScheduler.Run(ctx); err != nil {
-			log.Error("Failed scraper service", zap.Error(err))
-		}
-		log.Info("Stopping")
-	}(m.log)
-
-	if m.flagger == nil {
-		m.flagger = feature.DefaultFlagger()
-		if len(opts.FeatureFlags) > 0 {
-			f, err := overrideflagger.Make(opts.FeatureFlags, feature.ByKey)
-			if err != nil {
-				m.log.Error("Failed to configure feature flag overrides",
-					zap.Error(err), zap.Any("overrides", opts.FeatureFlags))
-				return err
-			}
-			m.log.Info("Running with feature flag overrides", zap.Any("overrides", opts.FeatureFlags))
-			m.flagger = f
-		}
-	}
+	m.closers = append(m.closers, labeledCloser{
+		label: "scraper",
+		closer: func(ctx context.Context) error {
+			scraperScheduler.Close()
+			return nil
+		},
+	})
 
 	var sessionSvc platform.SessionService
 	{
@@ -651,33 +677,6 @@ func (m *Launcher) run(ctx context.Context, opts *InfluxdOpts) (err error) {
 		NotificationRuleFinder:     notificationRuleSvc,
 	}
 
-	remotesSvc := remotes.NewService(m.sqlStore)
-	remotesServer := remotesTransport.NewInstrumentedRemotesHandler(
-		m.log.With(zap.String("handler", "remotes")), m.reg, remotesSvc)
-
-	replicationSvc := replications.NewService(m.sqlStore, ts, m.log.With(zap.String("service", "replications")), opts.EnginePath)
-	replicationServer := replicationTransport.NewInstrumentedReplicationHandler(
-		m.log.With(zap.String("handler", "replications")), m.reg, replicationSvc)
-
-	ts.BucketService = replications.NewBucketService(
-		m.log.With(zap.String("service", "replication_buckets")), ts.BucketService, replicationSvc)
-
-	replicationsFlag := feature.ReplicationStreamBackend()
-
-	if replicationsFlag.Enabled(ctx, m.flagger) {
-		if err = replicationSvc.Open(ctx); err != nil {
-			m.log.Error("Failed to open replications service", zap.Error(err))
-			return err
-		}
-
-		m.closers = append(m.closers, labeledCloser{
-			label: "replications",
-			closer: func(context.Context) error {
-				return replicationSvc.Close()
-			},
-		})
-	}
-
 	errorHandler := kithttp.NewErrorHandler(m.log.With(zap.String("handler", "error_logger")))
 	m.apibackend = &http.APIBackend{
 		AssetsPath:           opts.AssetsPath,
@@ -724,7 +723,6 @@ func (m *Launcher) run(ctx context.Context, opts *InfluxdOpts) (err error) {
 		SourceService:                   sourceSvc,
 		VariableService:                 variableSvc,
 		PasswordsService:                ts.PasswordsService,
-		InfluxQLService:                 storageQueryService,
 		InfluxqldService:                iqlquery.NewProxyExecutor(m.log, qe),
 		FluxService:                     storageQueryService,
 		FluxLanguageService:             fluxlang.DefaultService,
@@ -755,6 +753,7 @@ func (m *Launcher) run(ctx context.Context, opts *InfluxdOpts) (err error) {
 		authedUrmSVC := authorizer.NewURMService(b.OrgLookupService, b.UserResourceMappingService)
 		pkgerLogger := m.log.With(zap.String("service", "pkger"))
 		pkgSVC = pkger.NewService(
+			pkger.WithHTTPClient(pkger.NewDefaultHTTPClient(urlValidator)),
 			pkger.WithLogger(pkgerLogger),
 			pkger.WithStore(pkger.NewStoreKV(m.kvStore)),
 			pkger.WithBucketSVC(authorizer.NewBucketService(b.BucketService)),
@@ -784,10 +783,11 @@ func (m *Launcher) run(ctx context.Context, opts *InfluxdOpts) (err error) {
 	var templatesHTTPServer *pkger.HTTPServerTemplates
 	{
 		tLogger := m.log.With(zap.String("handler", "templates"))
-		templatesHTTPServer = pkger.NewHTTPServerTemplates(tLogger, pkgSVC)
+		templatesHTTPServer = pkger.NewHTTPServerTemplates(tLogger, pkgSVC, pkger.NewDefaultHTTPClient(urlValidator))
 	}
 
 	userHTTPServer := ts.NewUserHTTPHandler(m.log)
+	meHTTPServer := ts.NewMeHTTPHandler(m.log)
 	onboardHTTPServer := tenant.NewHTTPOnboardHandler(m.log, onboardSvc)
 
 	// feature flagging for new labels service
@@ -884,6 +884,11 @@ func (m *Launcher) run(ctx context.Context, opts *InfluxdOpts) (err error) {
 		),
 	)
 
+	configHandler, err := http.NewConfigHandler(m.log.With(zap.String("handler", "config")), opts.BindCliOpts())
+	if err != nil {
+		return err
+	}
+
 	platformHandler := http.NewPlatformHandler(
 		m.apibackend,
 		http.WithResourceHandler(stacksHTTPServer),
@@ -893,8 +898,8 @@ func (m *Launcher) run(ctx context.Context, opts *InfluxdOpts) (err error) {
 		http.WithResourceHandler(labelHandler),
 		http.WithResourceHandler(sessionHTTPServer.SignInResourceHandler()),
 		http.WithResourceHandler(sessionHTTPServer.SignOutResourceHandler()),
-		http.WithResourceHandler(userHTTPServer.MeResourceHandler()),
-		http.WithResourceHandler(userHTTPServer.UserResourceHandler()),
+		http.WithResourceHandler(userHTTPServer),
+		http.WithResourceHandler(meHTTPServer),
 		http.WithResourceHandler(orgHTTPServer),
 		http.WithResourceHandler(bucketHTTPServer),
 		http.WithResourceHandler(v1AuthHTTPServer),
@@ -903,6 +908,7 @@ func (m *Launcher) run(ctx context.Context, opts *InfluxdOpts) (err error) {
 		http.WithResourceHandler(annotationServer),
 		http.WithResourceHandler(remotesServer),
 		http.WithResourceHandler(replicationServer),
+		http.WithResourceHandler(configHandler),
 	)
 
 	httpLogger := m.log.With(zap.String("service", "http"))
